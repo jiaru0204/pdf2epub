@@ -65,11 +65,24 @@
 - `is_figure_page()` 返回 `Optional[bool]`：`None` = **判不了**（不是"确定不是图版页"）。
 - `dumps_product_json()` 末尾有**逐值自校验**（哨兵替换是格式 hack，对不上就拒绝落盘）。
 
+## 全盘运行（已验证的书）
+- `orign_pdf/围城.pdf` 368 页 / 300dpi → 1632×2335。
+- 拆页 `python -m pipeline.split_pages --pdf orign_pdf/围城.pdf`（约 47s / 56MB）。
+- OCR `python -m pipeline.ocr --pages orign_pdf/pages`（**正文页约 8.6~9.5s/页**，全书约 58 分钟）。
+  ⚠️ 必须 `--max-minutes 9` 分批续跑：**单次后台调用超过约 10 分钟会被静默回收**。
+- 全书对账结果（368 页）：9585 行 / 9587 det 框 / 差 2；三条不变式（bbox↔det_index、
+  det_index 划分、dropped bbox）**全部 0 不符**；异常计数全 0。
+- `orign_pdf/围城.txt` 是**原文对照文本**，抽检 93.1% 命中，但**版次不同**
+  （PDF=2005 重印 ISBN 7-02-002475-0，txt=2017 ISBN 978-7-02-012789-4）→
+  前置页（版权/CIP）对不上，做逐字评测要排除。
+- 已知薄弱位（真实书实测）：**引号 `”`、单个数字/符号**（8 条低 conf 里占 6 条）。
+
 ## 例行核验
 - 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（35 项）
-- 共用层：`.venv/Scripts/python.exe .tmp/test_common_review.py`（44 项）
+- 共用层：`.venv/Scripts/python.exe .tmp/test_common_review.py`（73 项）
 - 拆页：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项）
 - OCR：`.venv/Scripts/python.exe .tmp/test_ocr_review.py`（98 项）
+
 
 
 
