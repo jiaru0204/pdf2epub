@@ -1,15 +1,29 @@
 # -*- coding: utf-8 -*-
 """产线各阶段共用的唯一实现层。
 
-**口径只写一份**：判据、几何、原子写、产物 JSON 序列化、页图身份/过期判定、
-引擎构造与缓存指纹、输出目录锁 —— 这些一旦各阶段各写一套，就会出现
-"同一份数据两处口径不同"的经典失败（本项目历史上 02c/02d 各复制一份，
-与 `load_tl_aligned` 两份实现是同一个坑）。
+这里集中了原来在 02c / 02d 里各写一份、以及各阶段各写一份的三类东西：
+  ① **判据**：图片页、纯符号行、验收规则
+  ② **口径**：行排序（对齐引擎 `_BOX_SORT_Y_THRESHOLD`）、bbox 几何、
+     产物 JSON 的序列化、读产物的两代口径、字级定位（CTC 时间步 → x）
+  ③ **基建**：中文路径安全读写、**原子写**、**输出目录锁**、引擎构造与缓存指纹、
+     **页图身份 / 产物过期判定**
 
-目前覆盖的阶段：`pipeline.split_pages`（拆页）、`pipeline.ocr`（OCR 主链路）。
+**口径只写一份**：这些一旦各阶段各写一套，就会出现"同一份数据两处口径不同"的经典失败
+（本项目历史上 02c/02d 各复制一份，与 `load_tl_aligned` 两份实现是同一个坑）。
 
-⚠️ 本模块**只放已经在用的东西**。后续阶段（漏行审计 / 局部救援 / 字级复核）
-需要的接口等做到那一步再加，不留没人调用的空壳。
+模块职责分区（改动时对照着看）：
+    ⓪ 常数            ——— 所有"魔法数"只出现一次
+    ① 判据 / 契约      ——— 什么算图版页、什么算纯符号行、产物行长什么样
+    ② 几何与排序       ——— bbox、IoU、按引擎口径排序
+    ③ 中文路径图像 IO  ——— cv2 在中文路径会返回 None，统一从这走
+    ④ 原子落盘         ——— 半截文件绝不能留给下游
+    ⑤ 产物 JSON 读写   ——— 逐点数组压行；**严格校验**坏产物
+    ⑥ 页图身份 / 过期   ——— 判"产物还是不是这份页图的"
+    ⑦ 引擎构造与指纹    ——— 复用引擎实例；口径指纹用于断点续跑判据
+    ⑧ 输出目录锁       ——— 清单是 read-modify-write，不许并发
+    ⑨ 杂项            ——— 计数记账、UTF-8 stdout、列页名
+    ⑩ 证据归一化       ——— `top2` / `alt_candidates` 两代口径的统一读取
+    ⑪ 字级水平定位     ——— "这个字在原图哪儿"的唯一实现
 """
 from __future__ import annotations
 
@@ -17,28 +31,76 @@ import hashlib
 import importlib.metadata as md
 import json
 import os
+import re
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
+import cv2
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# ⓪ 常数：并发/重试这类"魔法数"也只在这里出现一次
+# ⓪ 常数：所有"魔法数"只在这里出现一次
 # ---------------------------------------------------------------------------
 #: `os.replace` 撞上 Windows 的"目标文件被别的句柄占用"时重试几次、每次等多久。
 #: 5 × 20ms 足够覆盖"读方只是短暂打开一下"；再长说明是真冲突，交给调用方去响。
 REPLACE_RETRIES = 5
 REPLACE_RETRY_SLEEP = 0.02
 
-# ---------------------------------------------------------------------------
-# ① 判据：图片页
-# ---------------------------------------------------------------------------
+#: 行排序换行阈值。**必须与引擎一致** —— rapidocr `ch_ppocr_det/main.py` 用
+#: `_BOX_SORT_Y_THRESHOLD = 10`（dy >= 10 才算换行，行内再按 x 排）。
+ENGINE_Y_THRESHOLD = 10
+
 #: 图片页判据：暗像素占比超过此值视为图版页（艺术字 rec 必然失败，非漏行）。
 FIG_INK = 0.45
 FIG_INK_GRAY_CUT = 160
+
+#: 纯符号行（含中文标点）—— 正则用 \W，配合 UNICODE 覆盖中文标点。
+SYMBOL_ONLY = re.compile(r"^[\W_]+$", re.UNICODE)
+
+#: 差异框尺寸门槛。**按页宽/页高归一化**，避免换书就要手调
+#: （原版是 02c 里的裸像素 60/20，对 2126px 与 4167px 宽的书不可能同时合适）。
+MIN_BOX_W_RATIO = 0.020
+MIN_BOX_H_RATIO = 0.006
+MIN_BOX_W_ABS = 24        # 绝对下限，防止极小页把阈值压到无意义
+MIN_BOX_H_ABS = 10
+
+
+class Line(TypedDict, total=False):
+    """产物里的一行文本。前四项是既有约定，后两项是救援阶段新增。"""
+    line_id: int                 # 当前产物空间的行号（1..n）
+    bbox: List[float]            # [x, y, w, h]，**原图坐标**
+    text: str
+    confidence: Optional[float]
+    orig_line_id: Optional[int]  # 重排前它在**源产物**里的行号；新增行=None
+    added: bool                  # 是否为救援时新插入的行
+
+
+# ---------------------------------------------------------------------------
+# ① 判据 / 契约
+# ---------------------------------------------------------------------------
+def symbol_only(text: str) -> bool:
+    """是否纯符号行（含中文标点）。"""
+    t = (text or "").strip()
+    return True if not t else bool(SYMBOL_ONLY.match(t))
+
+
+def accept(
+    new_text: str, new_conf: float, old_len: int = 0,
+    conf_accept: float = 0.85,
+) -> Tuple[bool, str]:
+    """验收：conf 达标 + 非空 + 非纯符号 + 字符数不缩水。返回 (通过, 原因)。"""
+    if new_conf < conf_accept:
+        return False, f"conf {new_conf:.3f} < {conf_accept}"
+    if not (new_text or "").strip():
+        return False, "空文本"
+    if symbol_only(new_text):
+        return False, "纯符号"
+    if old_len and len(new_text) < old_len:
+        return False, f"字符数缩水 {len(new_text)} < {old_len}"
+    return True, ""
 
 
 def is_figure_page(
@@ -76,7 +138,7 @@ def is_figure_page(
 
 
 # ---------------------------------------------------------------------------
-# ② 几何
+# ② 几何与排序
 # ---------------------------------------------------------------------------
 def xywh(box) -> Tuple[float, float, float, float]:
     """四点框 / 任意 (N,2) 形状 → (x, y, w, h)。"""
@@ -86,9 +148,164 @@ def xywh(box) -> Tuple[float, float, float, float]:
     return x0, y0, x1 - x0, y1 - y0
 
 
+def iou(a: Sequence[float], b: Sequence[float]) -> float:
+    """两个 (x, y, w, h) 的 IoU。"""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def center_in(inner: Sequence[float], outer: Sequence[float], pad: float = 0) -> bool:
+    """inner 的中心点是否落在 outer（外扩 pad）内。"""
+    x, y, w, h = inner
+    ox, oy, ow, oh = outer
+    cx, cy = x + w / 2, y + h / 2
+    return (ox - pad) <= cx <= (ox + ow + pad) and (oy - pad) <= cy <= (oy + oh + pad)
+
+
+def _require_bbox(line: Any, where: str) -> Tuple[float, float, float, float]:
+    """取 `line["bbox"]` 并校验契约：必须是 4 个可转 float 的数。
+
+    🔴 **不宽松处理**：`bbox` 是产物里一切空间运算（排序、IoU、裁片、对账）的输入，
+    出现 `null` / `[1]` / 字符串时就该当场炸在**离源头最近的地方**，而不是让排序函数
+    抛一个 `TypeError: 'NoneType' is not subscriptable` 让人去猜哪条产物坏了。
+    """
+    if not isinstance(line, dict):
+        raise ValueError(f"{where}: 期望 dict，实得 {type(line).__name__}")
+    bb = line.get("bbox")
+    if not isinstance(bb, (list, tuple)) or len(bb) < 4:
+        raise ValueError(f"{where}: bbox 必须是 [x, y, w, h]，实得 {bb!r}")
+    try:
+        return (float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3]))
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: bbox 含非数值：{bb!r}") from None
+
+
+def sort_lines_like_engine(
+    lines: List[Line], y_threshold: int = ENGINE_Y_THRESHOLD
+) -> List[Line]:
+    """按**引擎口径**排序：先 y 稳定排序，`dy >= y_threshold` 才算换行，行内按 x。
+
+    与引擎 `_BOX_SORT_Y_THRESHOLD` 对齐（原版 02d 用精确 `(y, x)` 元组排序，
+    同页有框 y 差 3px 时结果就可能与主链路不一致）。
+
+    ⚠️ 输入契约：每个元素的 `bbox` 必须是 `[x, y, w, h]`（可转 float）。
+    不满足时抛 `ValueError` 并指出是第几个元素 —— **不做静默跳过**，
+    因为"少排了一行"比"响亮报错"难查得多。
+    """
+    for i, L in enumerate(lines):
+        _require_bbox(L, f"sort_lines_like_engine: lines[{i}]")
+    seq = sorted(lines, key=lambda L: float(L["bbox"][1]))
+    groups: List[List[Line]] = []
+    cur: List[Line] = []
+    prev_y: Optional[float] = None
+    for L in seq:
+        y = float(L["bbox"][1])
+        if prev_y is None or (y - prev_y) >= y_threshold:
+            if cur:
+                groups.append(cur)
+            cur = [L]
+        else:
+            cur.append(L)
+        prev_y = y
+    if cur:
+        groups.append(cur)
+
+    out: List[Line] = []
+    for g in groups:
+        out.extend(sorted(g, key=lambda L: float(L["bbox"][0])))
+    return out
+
+
+def min_box_thresholds(page_w: int, page_h: int,
+                       w_ratio: float = MIN_BOX_W_RATIO,
+                       h_ratio: float = MIN_BOX_H_RATIO) -> Tuple[int, int]:
+    """按页尺寸算出该页的最小差异框宽高。"""
+    return (max(MIN_BOX_W_ABS, int(w_ratio * page_w)),
+            max(MIN_BOX_H_ABS, int(h_ratio * page_h)))
+
+
 # ---------------------------------------------------------------------------
-# ③ 落盘：**原子写**是全局约定（半截文件绝不能留给下游）
+# ③ 中文路径安全的图像 IO
 # ---------------------------------------------------------------------------
+def imread_u(path: Union[str, Path], flags: int = cv2.IMREAD_COLOR):
+    """中文路径安全的读图。
+
+    ⚠️ `cv2.imread` 在中文路径返回 None（OpenCV 已知限制），本项目所有路径含中文。
+    ⚠️ 读出来是 **BGR**，直接传 ndarray 给引擎时它**不会**再做 RGB2BGR 转换。
+    """
+    try:
+        buf = np.fromfile(str(path), dtype=np.uint8)
+        if buf.size == 0:
+            return None
+        return cv2.imdecode(buf, flags)
+    except Exception:
+        return None
+
+
+def imwrite_u(path: Union[str, Path], img) -> bool:
+    """中文路径安全的写图。**原子写** —— 与 `atomic_write_bytes` 同一套约定。
+
+    🔴 为什么要改：本模块顶部声明"所有写盘都走原子写"，而早期实现直接
+    `buf.tofile(最终路径)` —— 下游（OCR / 审计 / 扫描器）可能在这张图**还没写完**
+    的时候就看到它，于是把半截图当合法产物。整个流水线对"半截产物"的防护
+    必须没有例外，否则它就不成其为约定。
+    """
+    p = Path(path)
+    ext = os.path.splitext(str(p))[1] or ".png"
+    ok, buf = cv2.imencode(ext, img)
+    if not ok:
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        buf.tofile(str(tmp))
+        _replace_with_retry(tmp, p)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def page_size(png_path: Union[str, Path]) -> Optional[Tuple[int, int]]:
+    """(w, h)。只读文件头，不解码整图。"""
+    try:
+        from PIL import Image
+        with Image.open(png_path) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ④ 原子落盘：**原子写**是全局约定（半截文件绝不能留给下游）
+# ---------------------------------------------------------------------------
+def _replace_with_retry(tmp: Path, p: Path) -> None:
+    """`os.replace` + Windows 上的有界重试。
+
+    ⚠️ Windows 上 `os.replace` 在**目标文件正被别的句柄打开**时会抛 `PermissionError`
+    （读方并发读就会触发，实测踩到）。这不是数据问题，所以重试；
+    重试耗尽仍原样抛出 —— 不吞异常，读方该看到的失败照旧看得到。
+    """
+    for attempt in range(REPLACE_RETRIES):
+        try:
+            os.replace(tmp, p)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRIES - 1:
+                raise
+            time.sleep(REPLACE_RETRY_SLEEP)
+
+
 def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
     """原子写二进制：先写**唯一名**临时文件，再 `os.replace`。
 
@@ -100,10 +317,6 @@ def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
     保证不了"新的完整"。真正防并发靠**输出目录锁**（`OutputLock`，各阶段入口都在用），
     唯一名是第二道保险 —— 锁没覆盖到的地方（例如库被直接调用）也不会写坏。
 
-    ⚠️ Windows 特例：`os.replace` 在**目标文件正被别的句柄打开**时会抛 `PermissionError`
-    （读方并发读就会触发，实测踩到）。这不是数据问题，所以这里有**有界重试**；
-    重试耗尽仍原样抛出 —— 不吞异常，读方该看到的失败照旧看得到。
-
     ⚠️ 反向也成立：写方正在 `os.replace` 的那一瞬间，**读方 `open()` 也可能被拒**
     （ERROR_ACCESS_DENIED）。所以本项目的读方若可能与写方并发，必须容忍这个瞬时失败。
     正常用法是各阶段入口的输出目录锁把读写错开，不是让每个读点自己重试。
@@ -113,14 +326,7 @@ def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
     tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         tmp.write_bytes(data)
-        for attempt in range(REPLACE_RETRIES):
-            try:
-                os.replace(tmp, p)
-                break
-            except PermissionError:
-                if attempt == REPLACE_RETRIES - 1:
-                    raise
-                time.sleep(REPLACE_RETRY_SLEEP)
+        _replace_with_retry(tmp, p)
     except BaseException:
         # 失败时别把半截临时文件留在目录里（下游的 glob 迟早会扫到它）。
         try:
@@ -148,7 +354,7 @@ def file_sha256(path: Union[str, Path], chunk: int = 1 << 20) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ④ 产物 JSON 读写（格式唯一来源）
+# ⑤ 产物 JSON 读写（格式唯一来源）
 # ---------------------------------------------------------------------------
 # 「逐点数组」字段：这些是每行/每字一条记录的稠密数组，照常缩进会把产物撑成几千行。
 _COMPACT_KEYS = ("det_boxes", "top2")
@@ -169,8 +375,8 @@ def dumps_product_json(doc: Dict[str, Any], indent: int = 1) -> str:
     且比较的是**转义后**的形式，所以不会误伤正文。
 
     ⚠️ 这是个**格式 hack**，不是普通 `json.dumps()`：它依赖"正文里不会出现哨兵那样的
-    转义序列"。所以末尾带**自校验**（见下），一旦哪天不成立就**拒绝落盘**而不是写出
-    一份被悄悄改坏的产物。
+    转义序列"。所以末尾带**逐值自校验**，一旦前提不成立就**拒绝落盘**，
+    而不是写出一份被悄悄改坏的产物。
     """
     holders: Dict[str, str] = {}
     out: Dict[str, Any] = dict(doc)
@@ -209,11 +415,11 @@ def dumps_product_json(doc: Dict[str, Any], indent: int = 1) -> str:
             raise RuntimeError(
                 f"紧凑序列化失败：哨兵 {k!r} 没有出现在中间产物里（本函数内部 bug）")
         s = s.replace(k, v)
-    # 逐值对账：把紧凑结果解析回来，必须与"直接 json.dumps"的语义**完全一致**。
+    # 逐值对账：解析回来必须与"直接 json.dumps"的语义**完全一致**。
     # 只验"能解析"是不够的 —— 哨兵被正文里的同形转义序列误伤时，JSON 依然是合法的。
     try:
         if json.loads(s) != json.loads(json.dumps(doc, ensure_ascii=False)):
-            raise RuntimeError("紧凑序列化后内容与原文不一致")
+            raise RuntimeError("紧凑序列化后内容与原文不一致（哨兵被正文误伤）")
     except RuntimeError:
         raise
     except Exception as e:
@@ -225,6 +431,73 @@ def dumps_product_json(doc: Dict[str, Any], indent: int = 1) -> str:
 def write_product_json(path: Union[str, Path], doc: Dict[str, Any]) -> None:
     """原子写文本行产物（紧凑逐点数组）。**产物一律走这里**，别直接 json.dumps。"""
     atomic_write_text(path, dumps_product_json(doc))
+
+
+def read_lines(path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    """读文本行产物。**缺失/损坏一律返回 None**（不抛异常、也不返回半截结构）。
+
+    🔴 这里是"损坏"的**唯一判定点**，所以校验必须到位：
+    早期实现只判 `"lines" not in d`，于是 `{"lines": {}}`（dict）或 `{"lines": null}`
+    会一路走到 `ln.setdefault(...)` 才炸 —— docstring 说"损坏返回 None"，
+    实际却抛异常，调用方的 `except` 与否决定了它是崩还是静默错。
+    现在：顶层必须是 dict、`lines` 必须是 list、每个元素必须是 dict。
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    lines = d.get("lines")
+    if not isinstance(lines, list):
+        return None
+    for ln in lines:
+        if not isinstance(ln, dict):
+            return None
+    # 补齐新增字段的默认值，使下游无需判 None
+    for ln in lines:
+        ln.setdefault("orig_line_id", ln.get("line_id"))
+        ln.setdefault("added", False)
+    return d
+
+
+def write_lines(
+    path: Union[str, Path],
+    page: str,
+    lines: List[Line],
+    provenance: Dict[str, Any],
+    orig_line_count: Optional[int] = None,
+    added: int = 0,
+    det_boxes: Optional[List[list]] = None,
+    dropped_lines: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """写文本行产物（含 `orig_line_id` / `added` / `provenance`）。**原子写**。
+
+    ⚠️ `det_boxes` 必须**从源产物透传**：det 框与 rec 无关，救援只改文本行，
+    框一个都没动。不透传的话修补后的产物会缺这个字段，
+    下一次审计只能把它当"生产者没接上"跳过 —— 闭环就断了。
+
+    ⚠️ 行里的 `top2`（每个字的 top-2 概率）原样带着走 —— 救援只改个别字，
+    其余字的概率证据不该丢（丢了就没法对修补后的产物再做形近字分析）。
+    `dropped_lines` 是**历史快照**，原样透传，不代表救援后的残留。
+    """
+    doc: Dict[str, Any] = {
+        "page": page,
+        "engine": "linefix.v6+rescue",
+        "line_count": len(lines),
+        "orig_line_count": orig_line_count,
+        "added": added,
+        "provenance": provenance,
+        "lines": lines,
+    }
+    if det_boxes is not None:
+        doc["det_boxes"] = det_boxes
+    if dropped_lines is not None:
+        doc["dropped_lines"] = dropped_lines
+    write_product_json(path, doc)
 
 
 def load_json(path: Union[str, Path], default=None):
@@ -243,10 +516,15 @@ def dump_json(path: Union[str, Path], obj, indent: int = 1) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ⑤ 页图身份与"产物是否过期"
+# ⑥ 页图身份与"产物是否过期"
 # ---------------------------------------------------------------------------
 def image_fingerprint(png: Union[str, Path]) -> Dict[str, Any]:
-    """页图身份：字节数 + mtime_ns + 内容哈希。写进产物 `provenance`。"""
+    """页图身份：字节数 + mtime_ns + 内容哈希。写进产物 `provenance`。
+
+    ⚠️ 已知代价：每次调用都会读整张 PNG 算 SHA256，而 `image_drift()` 复核时
+    还会再算一遍。几十万字以内无所谓；页数上万时再加"按 (size, mtime_ns) 缓存"，
+    现在不加，因为**多一层缓存就多一个"错判过期"的机会**。
+    """
     p = Path(png)
     st = p.stat()
     return {
@@ -266,9 +544,9 @@ def image_drift(prov, png: Union[str, Path]) -> Optional[str]:
     ⚠️ 不这么做就会静默交付过期产物：只判"JSON 能解析"的话，
     重渲染页图后重跑 OCR 会**整本跳过**，而产物里还是旧页的文本。
 
-    🔴 **页图不存在也返回非 None**（`"页图不存在：..."`）。旧实现这里返回 `None`，
+    🔴 **页图不存在也返回非 None**（`"页图不存在：..."`）。早期实现这里返回 `None`，
     而调用方普遍把 `None` 读成"一致"——于是一张**缺失**的页图会被当成"产物没问题"，
-    正好绕过整个过期守卫。`None` 只表示一件事：**比过了，且一致**。
+    正好绕过整个过期守卫。`None` 只允许表示一件事：**比过了，且一致**。
     """
     if not isinstance(prov, dict):
         return "产物没有 provenance"
@@ -286,7 +564,7 @@ def image_drift(prov, png: Union[str, Path]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# ⑥ 引擎构造与缓存指纹
+# ⑦ 引擎构造与缓存指纹
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG_REL = "configs/rapidocr_openvino_ppocrv6_medium.yaml"
 
@@ -332,10 +610,15 @@ def build_engine(
         config_path: 完整配置文件；None 时自动找本项目 `configs/` 下的那份。
         log_level: rapidocr 日志级别（warning 可压掉 INFO 噪音）。
         extra_params: 额外的 `params` 覆盖，**最后合并（调用方优先）**。
+            给"某个调用点需要特殊开关"用，避免给每个开关都长一个形参。已用到：
+            · 字级定位 —— `Global.use_preprocess_img: False` + `Global.return_word_box: True`
+              （原因见 `rec_line_word_cols` 的说明）。
 
     ⚠️ `use_cls=False` **不会**阻止 TextClassifier 被构造，所以 Cls 段的
        `engine_type` 也必须指向已安装的后端（否则 ImportError）。
     ⚠️ 用 `params=` 时枚举值必须传 `EngineType` 枚举，传字符串会 TypeError。
+    ⚠️ 生产环境**复用同一个实例**：OpenVINO 初始化约 1s（首次含编译约 7.5s），
+       不要每条文本重建。
     """
     from rapidocr import RapidOCR
 
@@ -425,7 +708,11 @@ def _fingerprint_from_cfg_obj(c) -> Dict[str, Any]:
 
 
 def engine_fingerprint(engine) -> Dict[str, Any]:
-    """把当前引擎的配置抓成指纹，**用于写进产物做溯源**（需要已有引擎对象）。"""
+    """把当前引擎的配置抓成指纹，**用于写进产物做溯源**（需要已有引擎对象）。
+
+    ⚠️ 想**不构造引擎**就要这个指纹（比如产物复用判据的预检阶段）用
+    `ocr_fingerprint(cfg_path)` —— 它从配置文件读同一批键。
+    """
     return {**_versions(), **_fingerprint_from_cfg_obj(engine.cfg),
             "model_sha256": _model_files(engine.cfg)}
 
@@ -443,7 +730,7 @@ def ocr_fingerprint(cfg_path: Optional[Union[str, Path]] = None, alts: bool = Tr
 
     「口径」必须覆盖**所有会影响产物内容或判据的东西**：
       · 运行时：`rapidocr` / `openvino` / `numpy` / `opencv` 版本
-      · 后端：`backend`（**含 CLI 覆盖**，见下面 ⚠️）+ `backend_override`
+      · 后端：`backend`（**含 CLI 覆盖**）+ `backend_config` + `backend_override`
       · 模型：det / rec / cls 档位 + **权重文件实际 SHA256**
       · 配置：`max_side_len` / `box_thresh` / `text_score` / `use_cls` …
       · 本模块口径：`product_schema` / `hook_schema` / `alt_capture` /
@@ -527,7 +814,7 @@ def fingerprint_drift(stored, want: Dict[str, Any]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# ⑦ 输出目录独占锁（manifest / 汇总 JSON 都是 read-modify-write）
+# ⑧ 输出目录独占锁（清单 / 汇总 JSON 都是 read-modify-write）
 # ---------------------------------------------------------------------------
 class OutputLock:
     """输出目录的独占锁。
@@ -586,8 +873,18 @@ class OutputLock:
 
 
 # ---------------------------------------------------------------------------
-# ⑧ 杂项
+# ⑨ 杂项
 # ---------------------------------------------------------------------------
+def inc(stat: Dict[str, int], key: str, n: int = 1) -> None:
+    """计数式记账（**唯一实现**，各阶段共用）。
+
+    存在的意义：本项目的头号失败模式是"声明与实现不一致且不报错"。
+    凡是要写进日志/报告的那句"改了几条 / 一致 / 为空"，都必须来自一个**显式的数**，
+    而不是靠 `print` 里临时算的表达式 —— 那句 print 会被 `tail` 切掉。
+    """
+    stat[key] = stat.get(key, 0) + n
+
+
 def force_utf8_stdout() -> None:
     """Windows 控制台默认 GBK，中文日志会炸/乱码。"""
     try:
@@ -601,3 +898,223 @@ def list_pages(pages_dir: Union[str, Path], pattern: str = "page_*.png") -> List
     """列出页名（不含扩展名），按字典序（page_001 ... page_316）。"""
     d = Path(pages_dir)
     return sorted(p.stem for p in d.glob(pattern))
+
+
+# ---------------------------------------------------------------------------
+# ⑩ 证据归一化：读产物的**唯一**口径
+# ---------------------------------------------------------------------------
+def iter_alts(line: Dict[str, Any]):
+    """把两种产物口径归一成 `{"i","t","c1","p1","c2","p2"}`，按字符位置升序。
+
+    · **`top2`（现口径，带采集下限）**：`[[i,t,p1,c2,p2], ...]`，
+      `i` = 字符在行内的下标，`c1` 即 `text[i]`（所以不重复存）。
+      **只记 `p2/p1 >= provenance.top2_floor` 的位置**，所以数组**不与 `text` 对齐** ——
+      定位一律用 `i`，别用数组位置。
+    · **`alt_candidates`（旧口径，带门槛）**：`[{"i","t","c1","p1","c2","p2"}, ...]`，
+      只记 `p2/p1 > 0.05 且 p2 > 0.02` 的"摇摆位置"。
+
+    必须同时支持两者：存量产物里可能有旧口径，不该因为它老就重跑。
+
+    ⚠️ 混用时的可比性：旧产物的比值**天然不存在 0.05 以下**，拿它扫更低的阈值
+    会得到"结果相同"，那是**同义反复**不是结论。
+
+    🔴 **所有 OCR 证据关联都应依赖稳定 ID / index，而不是文本** ——
+    `top2` 用 `i` 定位、`det_boxes` 用 `det_index` 关联，都是同一条原则。
+    """
+    txt = line.get("text") or ""
+    top2 = line.get("top2")
+    if top2:
+        for e in top2:
+            if not isinstance(e, (list, tuple)) or len(e) < 5:
+                continue
+            i = int(e[0])
+            if not (0 <= i < len(txt)):
+                continue
+            yield {"i": i, "t": e[1], "c1": txt[i], "p1": e[2], "c2": e[3], "p2": e[4]}
+        return
+    for a in line.get("alt_candidates") or []:
+        if isinstance(a, dict):
+            yield a
+
+
+# ---------------------------------------------------------------------------
+# ⑪ 字级水平定位：「这个字在原图哪儿」的唯一实现
+# ---------------------------------------------------------------------------
+# 背景（实测，别重新推一遍）：
+#   `det` 只给**整行**框，没有逐字框。此前所有"按字裁片"的地方都用
+#   「**字数均分**」估字符 x —— 等宽假设，行内一混标点/拉丁/数字就错位，
+#   而 `人/入`、`已/己` 的差别恰恰在**只看像素**才判得出来。
+#
+#   其实模型自己给了逐字水平位置：CTC 的**时间步**。实测 `padW / T == 8.00`
+#   （归一化图上每个时间步 = 8 px），所以 t 与 x 成正比。
+#   rapidocr 也**原生支持**把它变成字符框（`cal_rec_boxes`），
+#   只要 `Global.return_word_box: True`：`TextRecOutput.word_results[0]` 是 `WordInfo`，
+#   带 `word_cols`（逐字时间步）与 `line_txt_len`（内容占用的**时间步总数**）。
+#
+#   🔴 库自己的换算是 `x_center = (col + 0.5) * W / line_txt_len`
+#      （`cal_rec_boxes/main.py::calc_box`）。实测 `line_txt_len` 与理论 `6 * W / H`
+#      逐条吻合，说明它是**归一化后的时间步**，不需要我们再复制 rapidocr 的预处理公式。
+#
+#   🔴 两个坑（都实测踩到）：
+#      ① `word_cols` **不含空白字符** —— 库分组时 `if char.isspace(): continue`。
+#         按数组位置对齐会**整体错位**，必须按文本逐字对齐（本模块负责补齐空白位）。
+#      ② rec_only 路径下 `Global.use_preprocess_img` 默认 **True**，会把送进来的
+#         裁片缩到 ≤2000 并按 **32 取整**（实测 2442×93 → 1984×64，行高被压 31%）。
+#         做字级定位时必须关，否则 x 的比例被扭。
+
+#: 时间步 → 像素的比例（归一化图 48px 高时）。**只用于自检**，正常路径不依赖它。
+CTC_PX_PER_STEP = 8.0
+
+
+def rec_line_word_cols(
+    engine, img: np.ndarray
+) -> Tuple[str, Optional[float], Optional[List[float]], Optional[float]]:
+    """单行 rec-only，返回 `(text, conf, cols, line_txt_len)`。
+
+    `cols` 与 `text` **逐字符 1:1 对齐**（空白位由相邻列线性插值补上，
+    因为库的 `word_cols` 丢掉了空白 —— 见本节顶部坑 ①）。
+
+    取不到（未开 `return_word_box`、或对齐失败）时 `cols=None`，调用方应退回均分。
+
+    ⚠️ **本函数不吞异常** —— 引擎抛错就让它冒出去，由调用方**记账**。
+       本项目栽过这个坑：`except` 只 `print` 不留计数，日志被 `tail` 切掉后
+       表现就是"这些位置没有候选"，看起来完全正常。**响亮失败优于静默降级。**
+
+    ⚠️ 取值一律用**显式长度判断**，不要用 truthiness：`res.txts` 若哪天变成
+       numpy 数组，`not arr` 会抛 `ValueError: truth value ... is ambiguous`。
+       这类"依赖返回类型恰好是 list"的写法在库升级时会变成难查的崩溃。
+
+    前提：`engine` 必须是
+    `build_engine(rec_only=True, extra_params={"Global.use_preprocess_img": False,
+    "Global.return_word_box": True, "Global.return_single_char_box": True})`
+    —— 否则裁片会被预处理扭曲，`line_txt_len` 也就不再对应**你给的那张图**。
+    """
+    res = engine(img)
+    if res is None:
+        return "", None, None, None
+    txts = getattr(res, "txts", None)
+    if txts is None or len(txts) == 0:
+        return "", None, None, None
+    text = txts[0] or ""
+    scores = getattr(res, "scores", None)
+    conf = float(scores[0]) if (scores is not None and len(scores) > 0) else None
+    wrs = getattr(res, "word_results", None)
+    wi = wrs[0] if (wrs is not None and len(wrs) > 0) else None
+    if wi is None or not text:
+        return text, conf, None, None
+    raw = [int(c) for wc in (getattr(wi, "word_cols", None) or ()) for c in wc]
+    L = getattr(wi, "line_txt_len", None)
+    if L is None or not raw:
+        return text, conf, None, None
+
+    n_nonspace = sum(0 if ch.isspace() else 1 for ch in text)
+    if n_nonspace != len(raw):
+        # 对齐失败比给错位置好：**响亮地退回**均分，并把原因交给调用方打印。
+        return text, conf, None, float(L)
+
+    cols: List[float] = []
+    k = 0
+    i = 0
+    while i < len(text):
+        if not text[i].isspace():
+            cols.append(float(raw[k]))
+            k += 1
+            i += 1
+            continue
+        j = i
+        while j < len(text) and text[j].isspace():
+            j += 1
+        prev = cols[-1] if cols else 0.0
+        nxt = float(raw[k]) if k < len(raw) else prev + (j - i)
+        span = j - i
+        for m in range(1, span + 1):
+            cols.append(prev + (nxt - prev) * m / (span + 1))
+        i = j
+    return text, conf, cols, float(L)
+
+
+def char_x_spans_from_cols(
+    bbox: Sequence[float], cols: Sequence[float], line_txt_len: Optional[float] = None
+) -> Optional[List[Tuple[float, float]]]:
+    """逐字水平区间（原图坐标）—— **端点标定**口径，本项目实际使用的那一个。
+
+    🔴 **这是"中心定位"模型，不是"真实字符 bbox"模型**（别误解）：
+    每个字符的宽度**一律取均分宽 `cw = W / n`**，只有**中心点**按 CTC 时间步伸缩：
+
+        x_center(i) = x0 + cw/2 + (W - cw) * (col_i − col_first) / (col_last − col_first)
+
+    然后由相邻中心点的**中点**切出边界，首尾各外延 `cw/2`。
+    也就是说它给出的是"**该字最可能落在哪一段**"，用于**裁片取像素**足够准，
+    但**不等于** OCR 模型输出的真实字符边界（宽字/窄字仍被当成等宽）。
+
+    🔴 为什么不用库自己的绝对换算 `(col + 0.5) * W / line_txt_len`
+    （即 `char_x_spans_from_cols_raw`）：实测在本项目台账上有**系统性偏移** ——
+    用「边界切墨量」这个客观代理量比较，raw 口径中位 **0.127**，而字数均分 **0.056**，
+    即 raw 的边界系统性压在笔画上。偏移量约 10~15 px（≈ 一个时间步）。
+    端点标定把这个恒定偏移**整体消掉**（首尾都被钉在框上），同时**保留**字距不均的信息
+    —— 对等距的行，它与均分**数学上恒等**。
+
+    ⇒ 三种口径的关系：
+       `even`（均分）            假设**所有**字等宽且铺满全框
+       `raw`（库绝对换算）        绝对位置准，但有 ~0.15 字宽的恒定偏移
+       `from_cols`（端点标定）    ← 本函数：无偏移，且随真实字距伸缩
+
+    `line_txt_len` 只用于**自洽检查**（raw 口径要用），端点标定不依赖它。
+    """
+    n = len(cols)
+    if n <= 0 or len(bbox) < 4:
+        return None
+    x0, _, w, _ = (float(v) for v in bbox[:4])
+    if w <= 0:
+        return None
+    cw = w / n
+    if n == 1:
+        return [(x0, x0 + w)]
+    span = float(cols[-1]) - float(cols[0])
+    if span <= 0:
+        return None
+    centers = [x0 + cw / 2.0 + (w - cw) * (float(c) - float(cols[0])) / span for c in cols]
+    if any(centers[i] > centers[i + 1] for i in range(n - 1)):
+        return None                       # 非单调 = 口径有问题，别拿去裁图
+    edges = ([centers[0] - cw / 2.0]
+             + [(centers[i] + centers[i + 1]) / 2.0 for i in range(n - 1)]
+             + [centers[-1] + cw / 2.0])
+    return list(zip(edges[:-1], edges[1:]))
+
+
+def char_x_spans_from_cols_raw(
+    bbox: Sequence[float], cols: Sequence[float], line_txt_len: float
+) -> Optional[List[Tuple[float, float]]]:
+    """**库原口径**：`x_center = (col + 0.5) * W / line_txt_len`（`cal_rec_boxes::calc_box`）。
+
+    保留它只为可复现的 A/B（`eval/review_sheet.py --loc raw`）—— 实测有 ~0.15 字宽的
+    恒定偏移，**不要**拿它当默认。见 `char_x_spans_from_cols` 的说明。
+    """
+    n = len(cols)
+    if n <= 0 or not line_txt_len or line_txt_len <= 0 or len(bbox) < 4:
+        return None
+    x0, _, w, _ = (float(v) for v in bbox[:4])
+    if w <= 0:
+        return None
+    centers = [x0 + w * (float(c) + 0.5) / float(line_txt_len) for c in cols]
+    if any(centers[i] > centers[i + 1] for i in range(n - 1)):
+        return None
+    cw = w / n
+    edges = ([centers[0] - cw / 2.0]
+             + [(centers[i] + centers[i + 1]) / 2.0 for i in range(n - 1)]
+             + [centers[-1] + cw / 2.0])
+    return list(zip(edges[:-1], edges[1:]))
+
+
+def char_x_spans_even(bbox: Sequence[float], n: int) -> Optional[List[Tuple[float, float]]]:
+    """「**字数均分**」估的逐字区间 —— 无 `cols` 时的退路，也是对照基线。
+
+    ⚠️ 只对**等宽、且铺满整框**的行成立。混了标点/拉丁/数字就会错位，
+    这正是它被替换掉的原因。保留它是为了 `--loc even` 能随时做 A/B。
+    """
+    if n <= 0 or len(bbox) < 4:
+        return None
+    x0, _, w, _ = (float(v) for v in bbox[:4])
+    if w <= 0:
+        return None
+    return [(x0 + w * i / n, x0 + w * (i + 1) / n) for i in range(n)]
