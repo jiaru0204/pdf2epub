@@ -138,6 +138,36 @@ def is_figure_page(
 
 
 # ---------------------------------------------------------------------------
+# 判据：印刷页码行
+# ---------------------------------------------------------------------------
+PAGE_NO_TEXT = re.compile(r"^\d{1,4}$")     # 整行 1~4 位纯数字
+PAGE_NO_Y = 0.85                            # 版心纵向位置阈：> 此值视为页脚区
+
+
+def page_number_role(text: str, bbox: Optional[Sequence[float]],
+                     page_h: int) -> str:
+    """给一行文本判角色：`"page_number"` 或 `"text"`。
+
+    判据两条（本书 368 页实测：367 行整行纯数字，其中 **363 行**落在
+    y/H 中位 0.92 —— 就是每页底部印的页码被 det 当成了一行正文）：
+      ① 整行文本是 1~4 位纯数字；
+      ② 位于页面纵向 `PAGE_NO_Y` 以下（页脚区）。
+
+    🔴 **只判定、不删除**。页码行照旧留在 `lines` 里（`det_boxes` 更不动），
+    下游按 `role == "page_number"` 过滤。为什么不删：漏行审计靠"det 有框、
+    产物无行"找线索，删掉行会让它把页码框**误报成漏行**。
+
+    ⚠️ ② 是必要条件。实测正文区也散着 4 行整行纯数字（例如 `page_336` 的 `99`
+    其实是破折号 `——”` 被识成了数字）—— 只按 ① 会把它们误标成页码。
+    """
+    if not PAGE_NO_TEXT.match(text or ""):
+        return "text"
+    if not bbox or len(bbox) != 4 or not page_h:
+        return "text"
+    return "page_number" if (bbox[1] / float(page_h)) > PAGE_NO_Y else "text"
+
+
+# ---------------------------------------------------------------------------
 # ② 几何与排序
 # ---------------------------------------------------------------------------
 def xywh(box) -> Tuple[float, float, float, float]:
@@ -572,7 +602,9 @@ DEFAULT_CONFIG_REL = "configs/rapidocr_openvino_ppocrv6_medium.yaml"
 #: 存在的意义：把"格式变了、旧产物却被当可复用"从静默混格式变成响亮重跑。
 #:   4 → 5：OCR 产物新增 `lines[].det_index` / `dropped_lines[].det_index`，
 #:          并把 top2 对齐口径从"文本多重集"改成"det 下标"（见 pipeline/ocr.py）。
-PRODUCT_SCHEMA = 5
+#:   5 → 6：OCR 产物新增 `lines[].role`（`"text"` / `"page_number"`）——
+#:          页码行**只打标记、不删除**，由下游过滤（见 `page_number_role()`）。
+PRODUCT_SCHEMA = 6
 
 
 def default_config_path() -> Optional[Path]:

@@ -49,7 +49,10 @@ from rapidfuzz import fuzz
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from linefix import common as C          # noqa: E402  —— 页码判据/页图尺寸都走共用层
+
 OUT_DIR = ROOT / "orign_pdf" / "textlines"
+PAGES_DIR = ROOT / "orign_pdf" / "pages"
 REF_TXT = ROOT / "orign_pdf" / "围城.txt"
 REPORT = ROOT / "docs" / "ocr-accuracy-围城.md"
 
@@ -62,9 +65,8 @@ SLIDE_STEP = 2
 CJK = re.compile(r"[\u4e00-\u9fff]")
 REF_FOOTNOTE = re.compile(r"\[\d+\]")                        # 对照文本的脚注标记写法
 HYP_FOOTNOTE = re.compile(r"[\u2460-\u2473\u3251-\u32bf]")   # ①-⑳ 等带圈数字
-PAGE_NO_LINE = re.compile(r"^\d{1,4}$")                      # 整行纯数字 = 疑似印刷页码
-PAGE_NO_Y = 0.85            # 页码行在页面纵向的位置阈（>85% 视为页脚区）
-PAGE_H = 2335               # 页图高度（300 DPI 下的 A5 开本）
+PAGE_NO_LINE = C.PAGE_NO_TEXT      # 整行 1~4 位纯数字（判据在 linefix.common，只有一份）
+# ⚠️ 页图高度不再硬编码：每页从 PNG 头读（换开本/换 DPI 就失效的常数不能留）。
 
 
 # ---------------------------------------------------------------- 归一化
@@ -92,23 +94,36 @@ def load_ocr_pages():
     """返回 [(页名, 全文本, 剔除页码行后的文本, top2 字数, 文档, 页码行清单)]。
 
     🔴 为什么要单独产出「剔除页码行」：实测 367 行是整行纯数字、其中 363 行位于页面
-    底部 92% 处 —— 那是**印刷页码被 det 当成了正文行**。对照文本不含页码，于是这些
-    数字会同时制造「整段插入」和「数字↔汉字替换」（Levenshtein 会拿它们去对邻近汉字），
-    把 CER 严重抬高。剔除后再算，才是真正的识别质量。
+    底部（y/H 中位 0.92）—— 那是**印刷页码被 det 当成了正文行**。对照文本不含页码，
+    于是这些数字会同时制造「整段插入」和「数字↔汉字替换」（Levenshtein 会拿它们去对
+    邻近汉字），把 CER 严重抬高。剔除后再算，才是真正的识别质量。
+
+    🔴 页码判定**不在这里另写一份**：产物带 `lines[].role`（PRODUCT_SCHEMA ≥ 6）就直接
+    读；旧产物（v5）用同一个 `linefix.common.page_number_role` 现算。页图高度逐页从
+    PNG 头读 —— 原先硬编码 2335，换开本/换 DPI 就会静默失效。
+
+    `页码行清单` 的元素是 `(det_index, 文本, y/H, 是否被判为页码)`：
+    **文本判据与角色判据的差集**就是"整行纯数字但其实不是页码"的那些行（正文区那 4 行）。
     """
     out = []
     for f in sorted(OUT_DIR.glob("*.textlines.json"), key=lambda p: p.name):
         d = json.loads(f.read_text(encoding="utf-8"))
         name = f.name[: -len(".textlines.json")]
+        sz = C.page_size(PAGES_DIR / f"{name}.png")
+        page_h = sz[1] if sz else 0
         keep, pageno = [], []
         for ln in d["lines"]:
             t = ln["text"]
-            y = ln["bbox"][1] if len(ln["bbox"]) == 4 else 0
-            is_pn = bool(PAGE_NO_LINE.match(t))
-            in_footer = (y / PAGE_H) > PAGE_NO_Y
-            if is_pn:
-                pageno.append((ln.get("det_index"), t, round(y / PAGE_H, 3), in_footer))
-            if is_pn and in_footer:
+            bbox = ln["bbox"] if len(ln.get("bbox") or []) == 4 else None
+            role = ln.get("role")
+            if role is None:                       # 旧产物（v5）：现算，判据同一份
+                role = C.page_number_role(t, bbox, page_h)
+            y = bbox[1] if bbox else 0
+            if PAGE_NO_LINE.match(t):              # 文本判据（用于统计"疑似页码"的总量）
+                pageno.append((ln.get("det_index"), t,
+                               round(y / page_h, 3) if page_h else 0.0,
+                               role == "page_number"))
+            if role == "page_number":
                 continue
             keep.append(t)
         out.append((name, "\n".join(ln["text"] for ln in d["lines"]),
@@ -489,6 +504,14 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
       "② Levenshtein 把它们对齐到邻近汉字上（如 `围`→`1`、`钱`→`9`），"
       "被计成「汉字↔非汉字」。**它们不是识别错误。**")
     A("⇒ 本报告额外给出一个**剔除页码行后**的口径作为「真实识别质量」。\n")
+    A("**产物侧已改成「打标记、不删除」**：`pipeline/ocr.py` 给每行落 `role` 字段"
+      "（`page_number` / `text`，判据实现在 `linefix.common.page_number_role`，只写一份，"
+      "评测脚本读的是同一个函数）。页码行仍留在 `lines` 里、`det_boxes` 更不动 ——"
+      "删行会让漏行审计把这些框误报成「有框无行」。")
+    A("")
+    A(f"⇒ 下游要过滤页码时**按 `role` 筛，别自己按「整行是数字」猜**："
+      f"上面那 {pn_stat['mid']} 行落在正文区的纯数字行就是反例 —— 例如 `page_336` 的 `99` "
+      f"其实是破折号 `——”` 被识成了数字，只按文本判据会被误杀。\n")
 
     A("### 0.4 三个归一化口径\n")
     A("| 口径 | 处理 | 回答的问题 |")
@@ -731,10 +754,13 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
 
     A("\n## 4. 抽查：逐条具体差异\n")
     A(f"抽查 **{len(sample)} 页** = 全书均匀取样 12 页 + 最差 5 页 + 指定的脚注页/漏行候选页。"
-      f"下表逐条列出 jiwer 对齐出的编辑操作（口径 N2）。\n")
+      f"下表逐条列出 jiwer 对齐出的编辑操作（口径 **N2 + 剔除页脚区页码行**，"
+      f"与 1.1 / 第 2 节同一口径）。\n")
     for nm in sample:
         x = aligned[idx[nm]]
-        seg, hyp = n2(x["seg"]), n2(x["hyp"])
+        # ⚠️ 与 1.1 主口径一致：用**剔除页脚区页码行**后的识别文本。
+        #    否则同一页在 §2（剔页码）与本节（含页码）会给出两个不同的 CER。
+        seg, hyp = n2(x["seg"]), n2(x["hyp_np"])
         s = jiwer.process_characters(seg, hyp)
         dropped = (x["doc"].get("dropped_lines") or [])
         A(f"\n### `{nm}`　CER **{pct(s.cer)}**　参考 {len(seg)} 字 / 识别 {len(hyp)} 字　"
@@ -791,7 +817,7 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
 
     A("\n## 6. 结论\n")
     A(f"1. **正文页逐字准确率 {pct(1 - N1.cer)}（N1 最严口径，已剔除脚注页与页码行）**；"
-      f"不剔页码是 {pct(1 - C1.cer)}，再排除全角/半角等编码差异是 {pct(1 - C2.cer)}。"
+      f"不剔页码是 {pct(1 - C1.cer)}；换 NFKC 归一化、同样剔页码后是 {pct(1 - N2.cer)}。"
       f"页边界经 0.5 的四项自检（锚定方式/单调性/平移敏感度/段长一致性），排名与归因不含对齐噪声。")
     A(f"2. **真正读错的汉字只有 {pct(NC.cer)}**（剔页码后）。其余差异绝大多数不是「认错字」，"
       f"而是标点与字符样式（见第 3 节）。")
@@ -803,11 +829,10 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
       f"最差 {pct(q(0.999))}。")
     A(f"5. 抽样逐条差异见第 4 节。需要纠错层处理的是「汉字↔汉字」那一类（形近字/真错字）；"
       f"破折号、标点样式与页码混入更适合**后处理规则**统一。")
-    A(f"6. 🔴 **必须修的产物缺陷：{pn_stat['n']} 行印刷页码被当成正文**"
-      f"（{pn_stat['pages']} 页，{pn_stat['bottom']} 行在页脚区）。"
-      f"它会进入下游 EPUB 正文，也污染所有对照指标。"
-      f"建议在 `pipeline/ocr.py` 里按「整行纯数字 + 位于页脚/页首区」剔除"
-      f"（或至少落一个 `page_number` 标记让下游可滤）。")
+    A(f"6. **印刷页码混入正文**（{pn_stat['n']} 行 / {pn_stat['pages']} 页，"
+      f"其中 {pn_stat['bottom']} 行在页脚区）**已按「打标记」处理**：产物每行带 "
+      f"`role`（`page_number` / `text`），页码行保留在 `lines` 里不删 —— 下游能滤掉它，"
+      f"漏行审计也仍看得到这些 det 框。**EPUB 生成侧按 `role != \"page_number\"` 取正文即可。**")
     A(f"7. 其余遗留：{len(dirty)} 页脚注因对照文本编码不同，无法直接逐字比对（已在 3.1 单列）；"
       f"{len(front)} 页前置/后置页与 {len(un)} 页无法锚定的页不参与指标（第 5 节）。\n")
 

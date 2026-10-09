@@ -23,8 +23,10 @@
   "elapsed_sec": 5.8,
   "provenance": { "backend": "openvino", "det": "PP-OCRv6/medium",
                   "det_boxes_source": "raw", "audit_capable": true,
-                  "alignment": "det_index", "product_schema": 5, ... },
+                  "alignment": "det_index", "product_schema": 6,
+                  "page_number_lines": 1, ... },
   "lines": [ {"line_id":1,"orig_line_id":1,"added":false,"det_index":0,
+              "role":"text",
               "bbox":[x,y,w,h],"text":"我们自己…","confidence":0.998,
               "top2":[[37,0.907,"已",0.093], [38,0.999,"们",0.0004]]} ],
   "det_boxes": [[x,y,w,h], ...],
@@ -35,6 +37,13 @@
 
 `det_boxes` = **过滤前的原始 det 框**（原图坐标，`[x,y,w,h]`）。它与产物行
 **不必然 1:1** —— 差值就是"有框无行"的漏行候选，这正是审计要找的东西。
+
+`lines[].role` = `"text"` / `"page_number"`。印刷页码行（每页底部那行数字）
+**只打标记、不删除** —— 删掉行会让漏行审计把页码框误报成"有框无行"。
+**下游要过滤页码时按 `role == "page_number"` 筛，不要自己按"整行是数字"猜**：
+实测正文区也散着 4 行整行纯数字（例如 `page_336` 的 `99` 其实是破折号 `——”`
+被识成了数字），只看文本会把它们误杀。判据实现在 `linefix.common.page_number_role`，
+只写一份。
 
 🔴 **`det_index` 是证据归属的唯一依据**（本模块最重要的一条口径）
 ----------------------------------------------------------------
@@ -615,6 +624,7 @@ def book_totals(out_dir: Path, pages_dir: Path, all_pages: List[str]) -> Dict[st
     ⚠️ 已知代价：每批结束都重扫全书 JSON。500 页无感，上万页要改成增量索引。
     """
     present = lines = det = low = chars = dropped = not_auditable = 0
+    pageno = 0
     stale: List[str] = []
     missing: List[str] = []
     for n in all_pages:
@@ -634,6 +644,8 @@ def book_totals(out_dir: Path, pages_dir: Path, all_pages: List[str]) -> Dict[st
             if conf is not None and conf < LOW_CONF:
                 low += 1
             chars += len(ln.get("top2") or [])
+            if ln.get("role") == "page_number":
+                pageno += 1
         if C.image_drift(prov, pages_dir / f"{n}.png"):
             stale.append(n)
     return {
@@ -641,6 +653,7 @@ def book_totals(out_dir: Path, pages_dir: Path, all_pages: List[str]) -> Dict[st
         "pages_missing": len(missing), "missing_pages": missing,
         "lines": lines, "det_boxes": det, "det_line_diff": max(0, det - lines),
         "low_conf": low, "top2_entries": chars, "dropped_lines": dropped,
+        "page_number_lines": pageno,
         "not_audit_capable": not_auditable,
         "stale": len(stale), "stale_pages": stale,
     }
@@ -869,6 +882,8 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
     n_done = n_skip = n_fail = n_lines = n_low = n_diff = 0
     n_chars_all = n_drop = n_mismatch = n_dropdrift = n_unres = 0
     n_t2err = n_t2zero = n_caperr = 0
+    n_rolefail = 0                   # 读不到页图尺寸 → 页码标记退化（响亮记账，不静默）
+    n_pageno_all = 0                 # 打上 role="page_number" 的行数
     n_norec: List[str] = []          # det 有框但 rec 全空 —— 高度可疑（真漏行信号）
     n_fig_empty: List[str] = []      # 同上，但判为图版页 → 艺术字 rec 空属预期，不算信号
     n_empty: List[str] = []          # det 也无框（空白页/纯图页）
@@ -932,6 +947,21 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
             print(f"[{k}/{len(names)}] {name}: ⚠ {n_un} 个 det 框没有可信的 rec 行"
                   f"（捕获失败 / 文本重建不一致），已标为 unresolved")
 
+        # 页码行**只打标记、不删除**（判据见 linefix.common.page_number_role 的说明：
+        # 删掉行会让漏行审计把页码框误报成"有框无行"）。判据只写一份，
+        # 评测脚本 scripts/ocr_accuracy_report.py 读的是同一个函数。
+        _sz = C.page_size(png)
+        page_h = _sz[1] if _sz else 0
+        n_pageno = 0
+        for ln in lines:
+            role = C.page_number_role(ln["text"], ln["bbox"], page_h)
+            ln["role"] = role
+            if role == "page_number":
+                n_pageno += 1
+        if _sz is None:
+            n_rolefail += 1
+            print(f"[{k}/{len(names)}] {name}: ⚠ 读不到页图尺寸，页码标记退化为全 text")
+
         doc = {
             "page": name,
             "engine": engine_name,
@@ -951,7 +981,10 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
                            "text_mismatch_lines": n_mis,
                            "dropped_captured": len(dumped),
                            "dropped_expected": expect_drop,
-                           "drop_selfcheck": "ok" if not drop_drift else "drift"},
+                           "drop_selfcheck": "ok" if not drop_drift else "drift",
+                           # 页码行**只标记不删除**：这里记下本页标了几行，
+                           # 下游按 lines[].role 过滤（保 audit 能力）。
+                           "page_number_lines": n_pageno},
             "lines": lines,
             "det_boxes": det_boxes,        # 字段必须存在（可为空列表）
             # `null` = 本次没采集（`--no-alts`）；`[]` = 采集了、确实没有丢弃行。
@@ -966,6 +999,7 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
         n_lines += len(lines)
         n_low += low
         n_chars_all += n_chars
+        n_pageno_all += n_pageno
         n_diff += diff
         n_drop += len(dumped)
         if not lines and det_boxes:
@@ -1003,6 +1037,8 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
           f"｜耗时 {elapsed_all:.1f}s")
     if n_done:
         print(f"  页均 {elapsed_all / n_done:.2f}s（不含引擎初始化 {init_sec:.1f}s）")
+        print(f"  页码行 {n_pageno_all} 条已标 role=\"page_number\"（**只标记不删除**，"
+              f"下游按 lines[].role 过滤；这样漏行审计仍能看到这些 det 框）")
 
     if not alts_on:
         print("\n⚠ --no-alts：本次**没有**采集 top2 与丢弃行证据，"
@@ -1046,6 +1082,9 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
               f"{', '.join(n_fig_unknown[:8])}")
     if n_empty:
         print(f"\nℹ {len(n_empty)} 页 det 无框（空白页/纯图页，正常）：{', '.join(n_empty[:8])}")
+    if n_rolefail:
+        print(f"\n⚠ {n_rolefail} 页读不到页图尺寸 → 这些页的页码标记全部退化成 "
+              f"role=\"text\"（页码会漏标）。产物仍可复用，但下游过滤会漏。")
 
     remaining = len(names) - n_done - n_skip
     if remaining > 0 and not n_fail:
@@ -1078,6 +1117,7 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
                      "drop_selfcheck_failed": n_dropdrift,
                      "det_index_unresolved": n_unres,
                      "text_mismatch_lines": n_mismatch,
+                     "page_number_lines": n_pageno_all,
                      "det_line_diff": n_diff, "elapsed_sec": round(elapsed_all, 1)},
         "book": book,
         "suspect_no_rec": n_norec, "figure_pages_empty": n_fig_empty,
@@ -1089,7 +1129,7 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
     print(f"  全书   -> {book['pages_present']}/{book['pages_in_dir']} 页有产物"
           f"｜{book['lines']} 行｜det {book['det_boxes']} 框｜差 {book['det_line_diff']}"
           f"｜低 conf {book['low_conf']}｜top2 {book['top2_entries']} 字"
-          f"｜丢弃证据 {book['dropped_lines']} 条" +
+          f"｜丢弃证据 {book['dropped_lines']} 条｜页码行 {book['page_number_lines']}" +
           (f"｜**过期 {book['stale']} 页**" if book["stale"] else "") +
           (f"｜**不可审计 {book['not_audit_capable']} 页**" if book["not_audit_capable"] else ""))
 
