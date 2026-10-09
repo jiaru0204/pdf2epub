@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 import time
 from pathlib import Path
@@ -342,61 +341,8 @@ def build_plan(doc, targets: List[int], out: Path, digits: int, prefix: str, dpi
 
 
 # ---------------------------------------------------------------------------
-# ⑤ 输出目录独占锁（manifest 是 read-modify-write，不许并发）
+# ⑤ 输出目录独占锁 —— 实现已上移到 `linefix.common.OutputLock`（口径只写一份）
 # ---------------------------------------------------------------------------
-class OutputLock:
-    """输出目录的独占锁。
-
-    锁机制是 OS 级 advisory lock（Windows `msvcrt` / POSIX `fcntl`）：**进程退出时
-    由内核释放**，包括崩溃和被强杀 —— 所以不会留下"僵尸锁"。锁文件本身留着无害。
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._fd: Optional[int] = None
-
-    def acquire(self) -> bool:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
-        fd = os.open(str(self.path), flags)
-        try:
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-                os.fsync(fd)
-            os.lseek(fd, 0, os.SEEK_SET)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return False
-        self._fd = fd
-        return True
-
-    def release(self) -> None:
-        if self._fd is None:
-            return
-        fd, self._fd = self._fd, None
-        try:
-            if os.name == "nt":
-                import msvcrt
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
 def preview(nums: List[int], limit: int = 8) -> str:
     s = ", ".join(str(x) for x in nums[:limit])
     return s + (f" …（共 {len(nums)} 个）" if len(nums) > limit else "")
@@ -540,7 +486,7 @@ def _run(args, pdf: Path, out: Path, doc) -> int:
         print(f"✗ 无法创建输出目录 {out}：{type(e).__name__}: {e}")
         return 2
 
-    lock = OutputLock(out / LOCKFILE)
+    lock = C.OutputLock(out / LOCKFILE)
     if not lock.acquire():
         print(f"✗ 已有另一个 split_pages 正在操作 {out}（{LOCKFILE} 被占用）")
         print("  并发运行会让 manifest 互相覆盖（磁盘 100 页、清单只剩 50 页），请等它跑完再重试。")

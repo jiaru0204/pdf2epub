@@ -30,9 +30,34 @@
 - `KeyboardInterrupt` 会照常写 manifest（返回 130），续跑靠按预测尺寸复核后补记（adopt）。
 - 并发：`<out>/.split_pages.lock`（OS advisory lock，进程退出自动释放）。
 - ⚠️ 换 pymupdf 版本必须重跑回归矩阵（`pixmap_size()` 依赖其 ceil 取整行为）。
-- `linefix/common.py` 当前**只有本阶段要用的 3 个函数**；别预先塞没人调用的接口。
+
+## OCR（产线第二环）`pipeline/ocr.py`
+- 调用：`python -m pipeline.ocr --pages <页图目录>` → `<pages>/../textlines/*.textlines.json` + `ocr_manifest.json`。
+- 🔴 **最重要的口径：`det_index` 是证据归属的唯一依据**。
+  `det_boxes[k]` ↔ `lines[].det_index == k` ↔ `dropped_lines[].det_index == k` 是**同一个 det 框**。
+  实现方式：在 `TextRecognizer.__call__` 处**复现引擎自己的 `argsort(width_list)` 分批**
+  （crop 顺序 = det 顺序），拿到「批次位置 → det 下标」。
+  **绝不用文本多重集反查** —— 同一页出现两次相同文本时那样只能猜，等于把 A 行的证据挂到 B 行的框上。
+  每页断言 `len(kept) == len(lines)`，不等就抛错（记 `top2_error`），不退回文本匹配。
+- 🔴 **验证不变式**：`lines[m].bbox == det_boxes[lines[m].det_index]`
+  （过滤只删不重排不改坐标，所以必须逐值相等；下标有偏差必然失败）。
+- `det_boxes` = **过滤前的原始 det 框**。`result.boxes` 与 `result.txts` 永远 1:1，**不能**当原始框用。
+- `provenance.audit_capable=False` 表示这是 `--allow-filtered-det` 降级产物，下游**必须拒绝审计**。
+- 版本闸门 `SUPPORTED_RAPIDOCR = ("3.9.2",)`：hook 的是 rapidocr 内部 API，未验证版本 exit 2。
+- 埋点（`--alts` 默认开）**不**降级：钩子装不上 → exit 1，要关必须显式 `--no-alts`。
+- 口径指纹（`check_reusable`）含：runtime 版本 + 权重实际 SHA256 + backend（含 `--backend` 覆盖）
+  + det_boxes_source + `product_schema` + `hook_schema` + top2 口径 + 关键配置键。
+- 并发：`<out>/.ocr.lock`。
+- ⚠️ 干净页面上绝大多数位置的 p2/p1 < `TOP2_FLOOR`(1e-3)，top2 稀疏是**预期**，不是没采到。
+
+## linefix 层的分工
+- `linefix/common.py` = **产线各阶段共用的实现层**（原子写 / 产物 JSON / 页图身份 / 引擎构造 /
+  缓存指纹 / `OutputLock` / 几何）。改动要在两个阶段都重跑回归。
+- 纠错层（`audit` / `rescue` / `recheck`）**尚未移植**，需要时再加。
 
 ## 例行核验
 - 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（35 项）
-- 拆页回归：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项，覆盖 review 的测试矩阵）
+- 拆页：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项）
+- OCR：`.venv/Scripts/python.exe .tmp/test_ocr_review.py`（98 项）
+
 
