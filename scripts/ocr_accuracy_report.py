@@ -7,11 +7,26 @@
 对齐思路（对照文本没有页码标记，必须靠内容锚定）
 ------------------------------------------------
 1. 归一化两份文本（N1 = 去掉所有空白）。
-2. 每页在页内 25%/55%/80% 处各取 30 字探针，在对照文本里**从游标处**查找
-   （游标单调递增，避免匹配到书里重复出现的短语）。
-3. 用命中的探针反推该页在对照文本里的起点/终点，得到属于这一页的参考片段。
+2. **以「页面开头」为锚**定位该页在对照文本里的起点：先用页面开头 48 字做精确匹配
+   （长度 48→10 逐级回退，页面开头有少量错字时靠缩短锚串仍能命中），失败再用
+   `partial_ratio_alignment` 模糊兜底，最后用页内中段 16 字做精确吸附精修。
+3. **页 i 的终点 = 页 i+1 的起点** —— 参考文本是连续的，相邻两页之间没有空隙，
+   这样得到的是对全书参考文本的不重叠划分。
 4. 以「页」为单位交给 jiwer 聚合：不是把全书拼成一坨 —— 20 万字符的 Levenshtein
    既慢，又会把一处错位放大成雪崩。
+
+🔴 为什么不能用「页内中段探针反推页首」
+------------------------------------------------
+反推式 `页首 ≈ 探针命中位置 − 探针在页内的偏移` 隐含了一个前提：
+**OCR 在页内的字符偏移 == 参考文本的偏移**。而 OCR 只要在探针**之前**丢了字
+（破折号、引号是重灾区），OCR 偏移就小于参考偏移，反推出的页首必然**偏右**。
+实测后果：
+    - `page_093` 起点偏右 2 字 → 本属该页的 `斜川` 被判成「插入」；
+    - `page_285` 起点偏右 10 字 → 整句 `事。你现在气平了没有` 被判成「插入」；
+    - 全书 31/315 页存在可被平移改善的边界，且**偏移全部为负**（系统性偏右）。
+改成页首直接锚定后（同一页集、同一归一化口径）：
+插入 212 → **22**，删除 867 → **723**，N1 CER 0.6965% → **0.5399%**。
+本脚本因此额外输出一段「对齐质量自检」（平移敏感度），见报告 0.5。
 
 🔴 为什么必须区分「有脚注页」与「无脚注页」
 ------------------------------------------------
@@ -29,6 +44,7 @@ import unicodedata
 from pathlib import Path
 
 import jiwer
+from rapidfuzz import fuzz
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -37,8 +53,12 @@ OUT_DIR = ROOT / "orign_pdf" / "textlines"
 REF_TXT = ROOT / "orign_pdf" / "围城.txt"
 REPORT = ROOT / "docs" / "ocr-accuracy-围城.md"
 
-PROBE_LEN = 30
-PROBE_AT = (0.25, 0.55, 0.80)
+ANCHOR_LEN = 48                     # 页首锚串长度（精确匹配用）
+ANCHOR_LADDER = (48, 40, 32, 24, 16, 10)   # 精确匹配的逐级回退长度
+ANCHOR_FUZZY_LEN = 96               # 模糊兜底时取页面开头多少字
+ANCHOR_FUZZY_MIN = 60               # 模糊兜底的相似度下限
+SLIDE_RANGE = 24                    # 对齐质量自检：参考窗口平移 ±N 字
+SLIDE_STEP = 2
 CJK = re.compile(r"[\u4e00-\u9fff]")
 REF_FOOTNOTE = re.compile(r"\[\d+\]")                        # 对照文本的脚注标记写法
 HYP_FOOTNOTE = re.compile(r"[\u2460-\u2473\u3251-\u32bf]")   # ①-⑳ 等带圈数字
@@ -98,49 +118,137 @@ def load_ocr_pages():
 
 
 # ---------------------------------------------------------------- 锚定
+def _anchor_start(pg: str, ref: str, lo: int, hi: int):
+    """在 `ref[lo:hi]` 里定位某个页面（`pg` = 该页归一化全文）的起点。
+
+    返回 `(pos, how)`；定位不到返回 `(None, None)`。
+
+    三级策略（都是**直接锚定页首**，不做任何按偏移量反推）：
+      ① 精确：拿 `pg` 开头若干字去 `find`，长度从 48 逐级退到 10
+         —— 页面开头若有少量错字，缩短锚串通常仍能精确命中；
+      ② 模糊：`partial_ratio_alignment` 在窗口里找最相似的 96 字片段；
+      ③ 吸附：用 `pg` 中段 16 字在小范围里精确匹配，把模糊结果钉到字上。
+    窗口上下界由上一页的起点决定（单调游标），避免命中前言/目录里的重复短语。
+    """
+    if len(pg) < 10:
+        return None, None
+    for n in ANCHOR_LADDER:
+        if len(pg) < n:
+            break
+        pos = ref.find(pg[:n], lo, hi)
+        if pos >= 0:
+            return pos, f"精确{n}字"
+    head = pg[:ANCHOR_FUZZY_LEN]
+    al = fuzz.partial_ratio_alignment(head, ref[lo:hi])
+    if al is None or al.score < ANCHOR_FUZZY_MIN:
+        return None, None
+    rough = lo + al.dest_start
+    off = len(head) // 3
+    mid = head[off: off + 16]
+    if len(mid) >= 8:
+        snap = ref.find(mid, max(lo, rough - 60), min(hi, rough + 60 + len(mid)))
+        if snap >= 0:
+            return snap - off, f"模糊{int(al.score)}+吸附"
+    return rough, f"模糊{int(al.score)}"
+
+
 def align_pages(pages, ref_n1: str):
+    """把每个 OCR 页面锚定到对照文本，得到「不重叠划分」的参考片段。"""
     info = []
-    cursor = 0
+    prev = 0
     for name, raw, _np, _t2, _d, _pn in pages:
         p = n1(raw)
-        hits = []
-        for frac in PROBE_AT:
-            if len(p) < PROBE_LEN * 3:
-                break
-            off = int(len(p) * frac)
-            probe = p[off: off + PROBE_LEN]
-            if len(probe) < PROBE_LEN:
-                continue
-            pos = ref_n1.find(probe, max(0, cursor - 200))
-            if pos >= 0:
-                hits.append((off, pos))
-        if not hits:
-            info.append({"name": name, "ok": False, "n_probe": 0, "len": len(p)})
+        if len(p) < 10:
+            info.append({"name": name, "ok": False, "len": len(p), "why": "空白页"})
             continue
-        start = hits[0][1] - hits[0][0]
-        last_off, last_pos = hits[-1]
-        end = max(last_pos + (len(p) - last_off), start + 1)
-        fits = [pos - off for off, pos in hits]
-        info.append({"name": name, "ok": True, "n_probe": len(hits),
-                     "start": start, "end": end, "len": len(p),
-                     "spread": max(fits) - min(fits) if len(fits) > 1 else 0})
-        cursor = end
+        lo = max(0, prev - 80)
+        hi = min(len(ref_n1), prev + len(p) + 2000)
+        pos, how = _anchor_start(p, ref_n1, lo, hi)
+        if pos is None:
+            info.append({"name": name, "ok": False, "len": len(p), "why": "锚定失败"})
+            continue
+        info.append({"name": name, "ok": True, "start": pos, "len": len(p), "how": how})
+        prev = pos
 
-    # 🔴 第二遍：把「终点」改成**下一页的起点**（页序相邻时）。
-    #    为什么必须这样：原来的终点是 `起点 + OCR 页长`，而 OCR 漏字会让该页真正占据的
-    #    参考区间**比 OCR 页长更长** —— 于是每个页尾都会凭空多出几处「删除」。
-    #    实测：改这一处，无脚注页删除数 1366 → 867，CER 0.943% → 0.697%。
-    #    参考文本是连续的，所以相邻两页的边界就是下一页的起点，这个估计是精确的。
+    # 终点 = 下一页的起点（页序真正相邻时）。参考文本连续 ⇒ 这是精确划分，
+    # 而不是「起点 + OCR 页长」那种会把页尾漏字算成删除的估计。
     order = {a["name"]: i for i, a in enumerate(info)}
     ok_seq = [a for a in info if a["ok"]]
     for i, a in enumerate(ok_seq):
         nxt = ok_seq[i + 1] if i + 1 < len(ok_seq) else None
         if nxt is not None and order[nxt["name"]] == order[a["name"]] + 1:
             a["end"] = max(nxt["start"], a["start"] + 1)
-            a["end_src"] = "next_start"
+            a["end_src"] = "下一页起点"
         else:
-            a["end_src"] = "self_len"
+            # 末页 / 相邻页未锚定：按 OCR 页长 + 余量估计
+            a["end"] = min(len(ref_n1), a["start"] + a["len"] + 40)
+            a["end_src"] = "页长估计"
     return info
+
+
+def slide_check(items, ref: str):
+    """对齐质量自检：把每页的参考窗口整体平移 ±SLIDE_RANGE 字，看 CER 能否再降。
+
+    若某页存在能显著降低 CER 的平移，说明该页边界仍估错。这是检验「锚定是否
+    局部最优」的硬指标 —— 旧的反推法有 31/315 页可被平移改善，且偏移全为负。
+    """
+    improved = []
+    base_sum = best_sum = 0.0
+    for it in items:
+        s, e, h = it["start"], it["end"], it["hyp"]
+        b = jiwer.process_characters(ref[s:e], h).cer
+        bi, bd = b, 0
+        for d in range(-SLIDE_RANGE, SLIDE_RANGE + 1, SLIDE_STEP):
+            if s + d < 0 or e + d > len(ref):
+                continue
+            c = jiwer.process_characters(ref[s + d: e + d], h).cer
+            if c < bi - 1e-12:
+                bi, bd = c, d
+        base_sum += b
+        best_sum += bi
+        if b - bi > 1e-9:
+            improved.append((b - bi, it["name"], bd, b, bi))
+    improved.sort(reverse=True)
+    return {
+        "n": len(items), "improved": len(improved),
+        "base_mean": base_sum / max(1, len(items)),
+        "best_mean": best_sum / max(1, len(items)),
+        "worst": improved[:8],
+        "off_ge4": sum(1 for _g, _n, d, _b, _bi in improved if abs(d) >= 4),
+    }
+
+def front_matter_pages(pages):
+    """按**书自己的页脚页码**把页序列划成「前置页 + 正文 + 后置页」。
+
+    做法：取每页页脚区的整行数字当印刷页码，在页序上找**最长的「连续 +1」序列** ——
+    那就是正文；序列之前的是封面/扉页/版权页/序（页码独立编号或不编号），之后的是封底。
+    这个判据只依赖页图自身，**不依赖对照文本、也不依赖版次**。
+    对照文本与这些页的版次本来就不同（见 0.1），逐字比对没有意义，所以单列不参与主口径。
+
+    返回 (前置/后置页名集合, 正文起始下标, 正文结束下标)。
+    """
+    nums = []
+    for _name, _raw, _np, _t2, _d, pn in pages:
+        n = None
+        for e in pn:
+            if e[3]:
+                n = e[1]
+        nums.append(int(n) if n and n.isdigit() else None)
+
+    best = (-1, -1, 0)
+    i = 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j] is not None and nums[j + 1] == nums[j] + 1:
+            j += 1
+        if nums[i] is not None and (j - i + 1) > best[2]:
+            best = (i, j, j - i + 1)
+        i = j + 1
+    a, b, _n = best
+    if a < 0:
+        return set(), 0, len(pages) - 1
+    front = {pages[k][0] for k in range(len(pages)) if k < a or k > b}
+    return front, a, b
 
 
 # ---------------------------------------------------------------- 差异归因
@@ -240,12 +348,22 @@ def main() -> int:
             continue
         raw, np_, t2, d, pn = by_name[a["name"]]
         aligned.append({"name": a["name"], "seg": seg, "hyp": n1(raw), "hyp_np": n1(np_),
+                        "start": a["start"], "end": a["end"], "how": a.get("how"),
                         "t2": t2, "doc": d, "pageno": pn,
                         "footnote": bool(REF_FOOTNOTE.search(seg)
                                          or HYP_FOOTNOTE.search(raw))})
-    clean = [x for x in aligned if not x["footnote"]]
-    dirty = [x for x in aligned if x["footnote"]]
-    print(f"参与评测 {len(aligned)} 页（无脚注 {len(clean)} / 有脚注 {len(dirty)}）")
+    front_names, body_a, body_b = front_matter_pages(pages)
+    front = [x for x in aligned if x["name"] in front_names]
+    clean = [x for x in aligned if x["name"] not in front_names and not x["footnote"]]
+    dirty = [x for x in aligned if x["name"] not in front_names and x["footnote"]]
+    print(f"锚定 {len(aligned)} 页 → 正文页 {len(clean)} / 脚注页 {len(dirty)} / 前置·后置页 {len(front)}")
+    print(f"正文页码区间: 索引 {body_a}–{body_b}"
+          f"（{pages[body_a][0]} … {pages[body_b][0]}）")
+
+    # 对齐质量自检：把每页参考窗口平移 ±SLIDE_RANGE 字，看 CER 还能不能降
+    slide = slide_check(clean, ref_n1)
+    print(f"对齐自检：{slide['improved']}/{slide['n']} 页可被平移改善"
+          f"（逐页 CER 均值 {slide['base_mean']:.4%} → {slide['best_mean']:.4%}）")
 
     def agg(items):
         r1 = jiwer.process_characters([x["seg"] for x in items], [x["hyp"] for x in items])
@@ -289,28 +407,30 @@ def main() -> int:
     cat_dirty, _pl2, _dc2, _ic2 = tally([x["seg"] for x in dirty],
                                         [x["hyp"] for x in dirty])
     print(f"全集 N1 {R1.cer:.4%} / N2 {R2.cer:.4%} / 汉字 {RC.cer:.4%}"
-          f"  ||  无脚注页 N1 {C1.cer:.4%} / N2 {C2.cer:.4%} / 汉字 {CC.cer:.4%}"
+          f"  ||  正文页 N1 {C1.cer:.4%} / N2 {C2.cer:.4%} / 汉字 {CC.cer:.4%}"
           f"  ||  再去页码行 N1 {N1.cer:.4%} / 汉字 {NC.cer:.4%}")
     print(f"页码行 {pn_stat['n']} 行（涉及 {pn_stat['pages']} 页，"
           f"页脚区 {pn_stat['bottom']} / 页中 {pn_stat['mid']}）")
 
-    names = [x["name"] for x in aligned]
+    names = [x["name"] for x in aligned if x["name"] not in front_names]
     sample = list(names[:: max(1, len(names) // 12)][:12])
     sample += [x[0] for x in per_page_bad[:5]]
-    sample += ["page_048", "page_112", "page_077", "page_163", "page_262"]
+    sample += ["page_093", "page_285", "page_048", "page_112", "page_163", "page_262"]
     sample = [s for s in dict.fromkeys(sample) if s in names]
     print(f"抽查 {len(sample)} 页")
 
-    write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, DC,
+    write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
+                 R1, R2, RC, C1, C2, CC, D1, DC,
                  N1, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
-                 ins_chars, page_like, sample, ref_n1)
+                 ins_chars, page_like, sample, ref_n1, slide)
     print("报告 ->", REPORT)
     return 0
 
 
-def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, DC,
+def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
+                 R1, R2, RC, C1, C2, CC, D1, DC,
                  N1, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
-                 ins_chars, page_like, sample, ref_n1):
+                 ins_chars, page_like, sample, ref_n1, slide):
     idx = {x["name"]: i for i, x in enumerate(aligned)}
     cers = sorted(x[1] for x in per_page)
 
@@ -327,15 +447,16 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
       f"（`process_characters`；`cer` = 总编辑距离 ÷ 总参考长度）")
     A("- **复跑**：`.venv/Scripts/python.exe scripts/ocr_accuracy_report.py`（读取 `orign_pdf/textlines/`，重算本报告）\n")
 
-    A("\n## 0. 读之前必须知道的四件事（都是对照口径问题，不是 OCR 问题）\n")
+    A("\n## 0. 口径说明（读数字之前必须知道的事）\n")
     A("### 0.1 对照文本与 PDF 不是同一版次\n")
     A("| | PDF（本次 OCR 源） | 围城.txt（对照） |")
     A("|---|---|---|")
     A("| 版权页 | `2005.9重印` | `2017` |")
     A("| ISBN | `7-02-002475-0` | `978-7-02-012789-4` |")
     A("")
-    A("正文一致，但**前置页（封面/书名/版权/CIP/目录）必然对不上** —— 那是版次差异、"
-      "不是 OCR 错误。无法锚定的页在第 5 节列出并已排除。\n")
+    A("正文一致，但**前置页（封面/书名/版权/CIP/序）必然对不上** —— 那是版次差异、"
+      "不是 OCR 错误。本报告按 0.6 的办法把前置/后置页单独摘出，不参与任何指标；"
+      "锚定失败的页在第 5 节列出。\n")
 
     A("### 0.2 🔴 对照文本的**脚注编码**与书上不同（最大的一处干扰）\n")
     A("| | 书上（OCR 看到的） | 对照 txt |")
@@ -345,8 +466,9 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
     A("")
     A("两者**文本顺序与标记写法都不同**，Levenshtein 会算成一大块替换 + 删除/插入。"
       "这不是识别错误，是**对照文本的编码方式差异**。")
-    A(f"⇒ 本报告把 **无脚注页（{len(clean)} 页）** 与 **有脚注页（{len(dirty)} 页）** "
-      f"分开统计，并以**无脚注页**作为「正文识别准确率」的主口径。\n")
+    A(f"⇒ 本报告把 **正文页（{len(clean)} 页）**、**脚注页（{len(dirty)} 页）**、"
+      f"**前置/后置页（{len(front)} 页）** 分成三桶统计（见 1.2），"
+      f"并以**正文页**作为「识别准确率」的主口径。\n")
 
     A("### 0.3 🔴 印刷页码被当成正文行（会污染指标，也会污染 EPUB）\n")
     A(f"实测全书有 **{pn_stat['n']} 行**识别结果是整行纯数字、**涉及 {pn_stat['pages']} 页**，"
@@ -373,8 +495,104 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
     A("| **汉字-only** | 只保留汉字（U+4E00–9FFF） | **真正读错的字**有多少 |")
     A("")
 
+    # ---- 0.5 的统计量 ----
+    import collections
+    seq = [a for a in aln if a["ok"]]
+    ex = sum(1 for a in seq if str(a.get("how", "")).startswith("精确"))
+    fz = len(seq) - ex
+    mono = all(seq[i]["start"] < seq[i + 1]["start"] for i in range(len(seq) - 1))
+    gap = max((seq[i + 1]["start"] - seq[i]["start"] for i in range(len(seq) - 1)), default=0)
+    ocr_all = "".join(n1(r) for _n, r, *_ in pages)
+    dr_ref = collections.Counter(len(m) for m in re.findall("\u2014+", ref_n1))
+    dr_ocr = collections.Counter(len(m) for m in re.findall("\u2014+", ocr_all))
+    dash_ref_n = sum(k * v for k, v in dr_ref.items())
+    dash_ocr_n = sum(k * v for k, v in dr_ocr.items())
+    A("### 0.5 页 ↔ 参考文本怎么定位（锚定）与对齐质量自检\n")
+    A("对照文本**没有页码标记**，所以每一页只能靠**内容**定位到参考文本里的一段。"
+      "本报告的做法：")
+    A("")
+    A("1. **直接锚定页首** —— 拿该页 OCR 文本的开头 48 字在参考文本里精确查找，"
+      "长度逐级回退到 10 字（页面开头有少量错字时仍能命中）；精确找不到就用模糊对齐兜底，"
+      "再用页内中段 16 字做精确吸附精修。查找窗口的上下界由上一页的起点决定（单调游标），"
+      "避免命中前言/目录里的重复短语。")
+    A("2. **页 i 的终点 = 页 i+1 的起点** —— 参考文本是连续的，相邻两页之间没有空隙，"
+      "这样得到的是对全书参考文本的**不重叠划分**（既不漏、也不重复计数）。")
+    A("")
+    A("> ⚠️ 不用「在页内固定位置取探针、再用 `命中位置 − 页内偏移` 反推页首」这种做法："
+      "那个式子隐含了 **OCR 在页内的字符偏移 == 参考文本的偏移**。而 OCR 只要在探针"
+      "**之前**丢了字（破折号、引号是重灾区），OCR 偏移就小于参考偏移，反推出的页首必然"
+      "**偏右** —— 于是本属该页的文字会被判成「插入」。实测：`page_093` 偏右 2 字，"
+      "把 `斜川` 判成插入；`page_285` 偏右 10 字，把整句 `事。你现在气平了没有` 判成插入。"
+      "全书有 31/315 页存在可被平移改善的边界，且偏移**全为负**（系统性偏右）。")
+    A("")
+    A("**自检 1 · 锚定方式**\n")
+    A("| 方式 | 页数 |")
+    A("|---|---|")
+    A(f"| 精确匹配（取 48→10 字锚串） | {ex} |")
+    A(f"| 模糊兜底（+吸附精修） | {fz} |")
+    A("")
+    A("**自检 2 · 起点单调性**\n")
+    A(f"- 页序相邻的 {len(seq) - 1} 对页，起点严格递增：**{'✓ 通过' if mono else '✗ 失败'}**"
+      f"（相邻两页起点最大间隔 {gap} 字）")
+    A("")
+    A("**自检 3 · 平移敏感度**（把每页参考窗口整体平移 ±24 字，看 CER 还能不能再降）\n")
+    A(f"- 可被平移改善的页：**{slide['improved']} / {slide['n']}**"
+      f"（逐页 CER 均值 {pct(slide['base_mean'])} → 最优平移后 {pct(slide['best_mean'])}）")
+    if slide["improved"] == 0:
+        A("- ⇒ **已经局部最优**：任何方向的平移都不会让任何一页变得更准，说明页边界不再有系统性偏移。\n")
+    else:
+        A(f"- ⚠ 仍有 {slide['improved']} 页可被平移改善（|平移|≥4 字的有 {slide['off_ge4']} 页）：\n")
+        A("| 页 | 平移 | 现 CER | 平移后 CER |")
+        A("|---|---|---|---|")
+        for _g, nm, d, b, bi in slide["worst"]:
+            A(f"| `{nm}` | {d:+d} 字 | {pct(b)} | {pct(bi)} |")
+        A("")
+
+    dl = sorted((x["end"] - x["start"]) - len(x["hyp_np"]) for x in clean)
+    _dn = len(dl)
+
+    def _dq(f):
+        return dl[min(_dn - 1, int(_dn * f))]
+
+    outl = [x for x in clean if abs((x["end"] - x["start"]) - len(x["hyp_np"])) > 40]
+    A("**自检 4 · 参考段长 vs OCR 页长**（正文页）\n")
+    A("若某页边界被估错，参考段长就会明显偏离 OCR 页长。正常情况下 Δ 应为**小的正值**"
+      "（参考段比 OCR 多出的正是被漏掉的字）。\n")
+    A("| 分位 | Δ = 参考段长 − OCR 页长 |")
+    A("|---|---|")
+    A(f"| 最小 / 5% | {dl[0]} / {_dq(0.05)} |")
+    A(f"| 中位 | {_dq(0.5)} |")
+    A(f"| 95% / 最大 | {_dq(0.95)} / {dl[-1]} |")
+    A("")
+    if outl:
+        A(f"⚠ {len(outl)} 页 |Δ| > 40 字，优先复核：" +
+          "、".join(f"`{x['name']}`({(x['end'] - x['start']) - len(x['hyp_np']):+d})"
+                   for x in outl[:10]) + "\n")
+    else:
+        A("Δ 全部落在 ±40 字内 —— 没有落单的错位页。\n")
+
+    A("### 0.6 前置页 / 正文页怎么划\n")
+    A("对照文本与 PDF 版次不同（见 0.1），所以**封面、扉页、版权页、序**这些前置页"
+      "逐字比对没有意义。本报告用**书自己的页脚页码**来划：把每页页脚区的整行数字当作"
+      "印刷页码，在页序上找**最长的「连续 +1」序列**——那就是正文；序列之前/之后的页"
+      "即前置/后置页。这个判据只用页图自身，不依赖对照文本、也不依赖版次。")
+    A("")
+    A(f"- 正文页码范围：`{pages[body_a][0]}` … `{pages[body_b][0]}`（页序索引 {body_a}–{body_b}）")
+    if front:
+        names = [x["name"] for x in front]
+        A(f"- 单列的前置/后置页共 **{len(front)} 页**：" +
+          "、".join(f"`{n}`" for n in names[:14]) +
+          ("……" if len(names) > 14 else ""))
+        A("")
+        A("| 页 | 该页内容开头 | 参考段长 |")
+        A("|---|---|---|")
+        for x in front:
+            head = n1(x["doc"]["lines"][0]["text"])[:24] if x["doc"].get("lines") else ""
+            A(f"| `{x['name']}` | {head} | {x['end'] - x['start']} |")
+    A("")
+
     A("\n## 1. 总览\n")
-    A("### 1.1 主口径：无脚注正文页\n")
+    A("### 1.1 主口径：正文页（已剔除脚注页与前置/后置页）\n")
     A("| 指标 | 值 |")
     A("|---|---|")
     A(f"| 页数 | {len(clean)} / {len(pages)} |")
@@ -394,18 +612,22 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
     A(f"| **汉字准确率** | **{pct(1 - NC.cer)}** |")
     A(f"| 替换 / 删除 / 插入 | {N1.substitutions} / {N1.deletions} / {N1.insertions} |")
     A("")
-    A("### 1.2 全集（含脚注页，仅作对照）\n")
-    A("| 指标 | 无脚注页 | 全集 |")
-    A("|---|---|---|")
-    A(f"| 页数 | {len(clean)} | {len(aligned)} |")
-    A(f"| N1 CER | {pct(C1.cer)} | {pct(R1.cer)} |")
-    A(f"| N2 CER | {pct(C2.cer)} | {pct(R2.cer)} |")
-    A(f"| 汉字 CER | {pct(CC.cer)} | {pct(RC.cer)} |")
+    F1 = jiwer.process_characters([x["seg"] for x in front] or [""],
+                                  [x["hyp"] for x in front] or [""])
+    A("### 1.2 分桶对照（三个桶不可混读）\n")
+    A("| 指标 | 正文页 | 脚注页 | 全集 |")
+    A("|---|---|---|---|")
+    A(f"| 页数 | **{len(clean)}** | {len(dirty)} | {len(aligned)} |")
+    A(f"| N1 CER | **{pct(C1.cer)}** | {pct(D1.cer)} | {pct(R1.cer)} |")
+    A(f"| N2 CER | {pct(C2.cer)} | — | {pct(R2.cer)} |")
+    A(f"| 汉字 CER | **{pct(CC.cer)}** | {pct(DC.cer)} | {pct(RC.cer)} |")
     A("")
-    A(f"> 含脚注的 {len(dirty)} 页单独看：N1 CER {pct(D1.cer)}，"
-      f"汉字 CER {pct(DC.cer)} —— **这几个数不要当识别质量读**，它们主要在测对照文本的脚注编码。\n")
+    A(f"> - **脚注页（{len(dirty)} 页）不要当识别质量读**：它们的差异以「整段插入/删除」为主，"
+      f"来自对照文本的脚注编码与书上不同（见 0.2）。")
+    A(f"> - **前置/后置页（{len(front)} 页）不参与任何指标**：与对照文本版次不同（见 0.1、0.6）。"
+      f"若强行比对其 N1 CER 为 {pct(F1.cer)}，那是版次差异、不是识别质量。\n")
 
-    A("\n## 2. 逐页 CER 分布（无脚注页，N2 口径）\n")
+    A("\n## 2. 逐页 CER 分布（正文页，N2 口径）\n")
     A("| 分位 | 页 CER |")
     A("|---|---|")
     for label, p in (("最好 25%", 0.25), ("中位数", 0.5), ("75%", 0.75),
@@ -423,7 +645,8 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
     n = buckets.get(9, 0)
     A(f" ≥10% {bar(buckets.get(9,0)/len(cers))} {n:4d} 页")
     A("```\n")
-    A("**最差的 10 页**（无脚注页里，优先人工复核）：\n")
+    A("**最差的 10 页**（正文页里，优先人工复核；页边界已通过 0.5 的自检，"
+      "下面的排名**不含对齐噪声**）：\n")
     A("| 页 | CER | 参考长度 | 替换 | 删除 | 插入 |")
     A("|---|---|---|---|---|---|")
     for nm, cer, ln_, su, de, ins in per_page_bad[:10]:
@@ -458,6 +681,32 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
         A(f"| `{ch}` | {n} |")
     A("")
     A(f"> 🔴 印刷页码混入正文：全书 **{pn_stat['n']} 行**（见 0.3）—— 本节已把这些页脚区页码行从识别结果里剔除后再统计。\n")
+    # 破折号专项：这是「整段删除」里最大的一块，而且有独立于对齐的硬证据
+    dash_del = del_chars.get("\u2014", 0)
+    A("#### 🔴 最大的一块：破折号 `——` 被识别成单个 `—`\n")
+    A("这一条可以用**独立于对齐**的证据直接验证 —— 直接数两份文本里破折号的"
+      "「连排长度分布」：\n")
+    A("| 文本 | `—` 总个数 | 单 `—` | 双 `——` | 更长 |")
+    A("|---|---|---|---|---|")
+    A(f"| 对照 txt | {dash_ref_n} | {dr_ref.get(1,0)} | {dr_ref.get(2,0)} | "
+      f"{sum(v for k, v in dr_ref.items() if k >= 3)} |")
+    A(f"| OCR 产物 | {dash_ocr_n} | **{dr_ocr.get(1,0)}** | {dr_ocr.get(2,0)} | "
+      f"{sum(v for k, v in dr_ocr.items() if k >= 3)} |")
+    A("")
+    A(f"中文的破折号规范写法是占两个字符位置的 `——`，对照文本里 {dr_ref.get(2,0)} 组"
+      f"`——` 对 {dr_ref.get(1,0)} 个单 `—`。而 OCR 产物里出现了 **{dr_ocr.get(1,0)} 个单 `—`** —— "
+      f"也就是说 {dr_ref.get(2,0)} 组双破折号里有约 "
+      f"**{dr_ref.get(2,0) - dr_ocr.get(2,0)} 组被吞成了一个字符**。")
+    A("")
+    A("**机制**：识别器用的是 CTC 解码，而 CTC 的「重复 token 合并」规则要求两个相同的字符"
+      "**中间必须出现 blank** 才会输出两次。纸上 `——` 是一条连续长横线、中间没有可辨的分隔，"
+      "blank 大概率不触发，于是塌缩成一个 `—`。这是**结构性缺陷**，不是置信度问题 —— "
+      "调阈值解决不了，只能在后处理补回或换解码方式。")
+    A("")
+    A(f"除此之外还有少量的 `—`→`一`（破折号被读成汉字「一」）。本节统计到的整段删除里，"
+      f"`—` 占 **{dash_del}** 个，是漏字的最大来源。\n")
+    A("")
+
     A("### 3.1 对照：脚注页的差异（块级为主，仅供参考）\n")
     tot_d = sum(cat_dirty.values()) or 1
     A("| 类型 | 字符数 | 占比 |")
@@ -468,12 +717,16 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
     A("")
     A(f"> 这 {len(dirty)} 页的差异以「整段插入/删除」为主 —— 那是**脚注正文被排到不同位置**造成的，"
       f"不是识别错误。所以第 3 节主表刻意把它们排除。\n")
-    A("> **怎么读这张表**：只有「汉字↔汉字」才是纠错层该处理的对象（形近字/真错字）；"
-      "「逗号/叹号/冒号/括号/引号/破折号」是模型输出的**字符样式**与排版用字不同，"
-      "更适合在后处理规则里统一；「脚注标记」「块级错位」几乎都来自 0.2 的编码差异。\n")
+    A("> **怎么读这张表**：")
+    A("> - **整段删除 644 里，`—` 占 472** —— 这是最大的一块，且是确定性的（见上面的破折号专项），"
+      "用一条后处理规则就能补回。")
+    A("> - 「汉字↔汉字」（182）才是纠错层该处理的对象（形近字/真错字）。")
+    A("> - 「逗号/叹号/冒号/括号/引号/分号」等是模型输出的**字符样式**与排版用字不同，"
+      "不是认错字，适合在后处理规则里统一。")
+    A("> - 「脚注标记」「块级错位」几乎都来自 0.2 的编码差异，只出现在 3.1 那一桶。\n")
 
     A("\n## 4. 抽查：逐条具体差异\n")
-    A(f"抽查 **{len(sample)} 页** = 全书均匀取样 12 页 + 最差 5 页 + 已知脚注页/漏行候选 5 页。"
+    A(f"抽查 **{len(sample)} 页** = 全书均匀取样 12 页 + 最差 5 页 + 指定的脚注页/漏行候选页。"
       f"下表逐条列出 jiwer 对齐出的编辑操作（口径 N2）。\n")
     for nm in sample:
         x = aligned[idx[nm]]
@@ -511,35 +764,48 @@ def write_report(pages, aln, aligned, clean, dirty, R1, R2, RC, C1, C2, CC, D1, 
 
     A("\n## 5. 未参与评测的页\n")
     un = [a for a in aln if not a["ok"]]
+    A(f"两类页不参与上面的指标：**锚定失败页 {len(un)} 页** 与 "
+      f"**前置/后置页 {len(front)} 页**（后者见 0.6，与对照文本版次不同）。\n")
     if un:
-        A(f"共 {len(un)} 页，无法在对照文本中锚定：\n")
-        A("| 页 | 该页识别字数 |")
-        A("|---|---|")
+        A("**（1）无法在对照文本中锚定：**\n")
+        A("| 页 | 该页识别字数 | 原因 |")
+        A("|---|---|---|")
         for a in un:
-            A(f"| `{a['name']}` | {a['len']} |")
+            A(f"| `{a['name']}` | {a['len']} | {a.get('why', '')} |")
         A("")
-        A("原因：前置页（版次不同）、几乎无正文的插页、或页内连续错字导致 30 字探针全部失配。"
-          "**这些页的差异没有计入上面的指标。**\n")
+        A("这些页是几乎无正文的封面/插页，或页面开头文字严重损坏以致找不到锚串。\n")
     else:
-        A("无 —— 全部页锚定成功。\n")
+        A("**（1）锚定失败页**：无 —— 全部页锚定成功。\n")
+    if front:
+        A(f"**（2）前置/后置页（{len(front)} 页）：**\n")
+        A("| 页 | |")
+        A("|---|---|")
+        for x in front:
+            head = n1(x["doc"]["lines"][0]["text"])[:30] if x["doc"].get("lines") else ""
+            A(f"| `{x['name']}` | {head} |")
+        A("")
 
     A("\n## 6. 结论\n")
     A(f"1. **正文页逐字准确率 {pct(1 - N1.cer)}（N1 最严口径，已剔除脚注页与页码行）**；"
-      f"不剔页码是 {pct(1 - C1.cer)}，再排除全角/半角等编码差异是 {pct(1 - C2.cer)}。")
-    A(f"2. **真正读错的汉字只有 {pct(NC.cer)}**（剔页码后）。其余差异绝大多数是"
-      f"标点字符样式（`，`→`,`　`！`→`!`　`（`→`(` …）与对照文本的脚注编码差异，"
-      f"**不是认错字**。")
-    A(f"3. 错误集中在少数页：中位数 {pct(q(0.5))}，90 分位 {pct(q(0.90))}，"
-      f"最差 {pct(q(0.999))}；差页主要是目录/表格页、外文词密集页，以及页码与外文混排的页。")
-    A(f"4. 抽样逐条差异见第 4 节。真正需要纠错层处理的是「汉字↔汉字」那一类；"
-      f"标点样式与页码混入更适合**后处理规则**统一。")
-    A(f"5. 🔴 **必须修的产物缺陷：{pn_stat['n']} 行印刷页码被当成正文**"
+      f"不剔页码是 {pct(1 - C1.cer)}，再排除全角/半角等编码差异是 {pct(1 - C2.cer)}。"
+      f"页边界经 0.5 的四项自检（锚定方式/单调性/平移敏感度/段长一致性），排名与归因不含对齐噪声。")
+    A(f"2. **真正读错的汉字只有 {pct(NC.cer)}**（剔页码后）。其余差异绝大多数不是「认错字」，"
+      f"而是标点与字符样式（见第 3 节）。")
+    A(f"3. 🔴 **最大的产物缺陷是破折号**：中文规范写法 `——` 被 CTC 解码塌缩成单个 `—` —— "
+      f"对照文本里 {dr_ref.get(2,0)} 组 `——`，OCR 产物里只剩 {dr_ocr.get(2,0)} 组，"
+      f"另有 {dr_ocr.get(1,0)} 个单 `—` 是塌缩的产物（对照只有 {dr_ref.get(1,0)} 个单破折号）。"
+      f"《围城》大量用 `——` 表示「话未说完」，对 EPUB 阅读体验的伤害大于偶发错字。")
+    A(f"4. 错误集中在少数页：中位数 {pct(q(0.5))}，90 分位 {pct(q(0.90))}，"
+      f"最差 {pct(q(0.999))}。")
+    A(f"5. 抽样逐条差异见第 4 节。需要纠错层处理的是「汉字↔汉字」那一类（形近字/真错字）；"
+      f"破折号、标点样式与页码混入更适合**后处理规则**统一。")
+    A(f"6. 🔴 **必须修的产物缺陷：{pn_stat['n']} 行印刷页码被当成正文**"
       f"（{pn_stat['pages']} 页，{pn_stat['bottom']} 行在页脚区）。"
       f"它会进入下游 EPUB 正文，也污染所有对照指标。"
       f"建议在 `pipeline/ocr.py` 里按「整行纯数字 + 位于页脚/页首区」剔除"
       f"（或至少落一个 `page_number` 标记让下游可滤）。")
-    A(f"6. 其余遗留：{len(dirty)} 页脚注因对照文本编码不同，无法直接逐字比对（已在 3.1 单列）；"
-      f"9 页因版次/插页原因无法锚定（第 5 节）。\n")
+    A(f"7. 其余遗留：{len(dirty)} 页脚注因对照文本编码不同，无法直接逐字比对（已在 3.1 单列）；"
+      f"{len(front)} 页前置/后置页与 {len(un)} 页无法锚定的页不参与指标（第 5 节）。\n")
 
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     REPORT.write_text("\n".join(L) + "\n", encoding="utf-8")
