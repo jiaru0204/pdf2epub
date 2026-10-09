@@ -22,7 +22,8 @@
    manifest 不一致就**拒绝续跑**；manifest 缺失但目录里已有 PNG、或 manifest 损坏，
    同样拒绝——宁可让用户换目录，也不把来源不明的页图当成自己的产物。
    `--force` **只**表示「同来源、同配置，重渲已存在的页」，不再具有"接受另一份 PDF"的权限。
-3. **原子写盘**：先写 `<名>.png.tmp` 再 `os.replace`，避免半截文件被下游当成合法产物。
+3. **原子写盘**：先写**唯一名**临时文件再 `os.replace`（实现见 `linefix.common.atomic_write_bytes`），
+   避免半截文件被下游当成合法产物。
 4. **并发保护**：`<out>/.split_pages.lock` 独占锁（OS advisory，进程退出即释放）。
    manifest 是 read-modify-write，两个进程同时跑会互相覆盖。
 5. **页名对齐**：`page_001.png`（默认 3 位），页数超过 999 时自动加宽。

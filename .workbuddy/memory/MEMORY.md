@@ -52,12 +52,24 @@
 
 ## linefix 层的分工
 - `linefix/common.py` = **产线各阶段共用的实现层**（原子写 / 产物 JSON / 页图身份 / 引擎构造 /
-  缓存指纹 / `OutputLock` / 几何）。改动要在两个阶段都重跑回归。
+  缓存指纹 / `OutputLock` / 几何）。改动要在所有阶段重跑回归。
 - 纠错层（`audit` / `rescue` / `recheck`）**尚未移植**，需要时再加。
+- 🔴 `fingerprint_drift()` **fail closed**：`want` 里只要有 `_` 前缀键（如 `_cfg_error`）
+  一律返回非空差异。"指纹算不出来"绝不能被读成"指纹一致"。
+- `ocr_fingerprint` 的 backend 记三个键：`backend_config` / `backend_override` / `backend`（生效）。
+- 🔴 `atomic_write_bytes` 临时名 = `.{名}.{pid}.{tid}.tmp`（唯一、隐藏）。
+  **Windows 实测**：`os.replace` 撞上"目标被别的句柄打开"会抛 `PermissionError`
+  （写侧已有界重试 5×20ms）；反向地，写方 replace 的一瞬间**读方 open 也会被拒**
+  ⇒ 读写并发要靠输出目录锁错开，不要让每个读点自己重试。
+- `image_drift()` 返回 `None` **只**表示"比过了且一致"；页图不存在返回 `"页图不存在：..."`。
+- `is_figure_page()` 返回 `Optional[bool]`：`None` = **判不了**（不是"确定不是图版页"）。
+- `dumps_product_json()` 末尾有**逐值自校验**（哨兵替换是格式 hack，对不上就拒绝落盘）。
 
 ## 例行核验
 - 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（35 项）
+- 共用层：`.venv/Scripts/python.exe .tmp/test_common_review.py`（44 项）
 - 拆页：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项）
 - OCR：`.venv/Scripts/python.exe .tmp/test_ocr_review.py`（98 项）
+
 
 

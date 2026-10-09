@@ -18,10 +18,20 @@ import importlib.metadata as md
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# ⓪ 常数：并发/重试这类"魔法数"也只在这里出现一次
+# ---------------------------------------------------------------------------
+#: `os.replace` 撞上 Windows 的"目标文件被别的句柄占用"时重试几次、每次等多久。
+#: 5 × 20ms 足够覆盖"读方只是短暂打开一下"；再长说明是真冲突，交给调用方去响。
+REPLACE_RETRIES = 5
+REPLACE_RETRY_SLEEP = 0.02
 
 # ---------------------------------------------------------------------------
 # ① 判据：图片页
@@ -34,23 +44,32 @@ FIG_INK_GRAY_CUT = 160
 def is_figure_page(
     png_path: Union[str, Path],
     ink_thresh: float = FIG_INK,
-    cache: Optional[Dict[str, bool]] = None,
-) -> bool:
+    cache: Optional[Dict[str, Optional[bool]]] = None,
+) -> Optional[bool]:
     """图片页判据：暗像素占比 > 阈值。
 
+    返回 **`Optional[bool]`**：`True` = 图版页 / `False` = 不是 / **`None` = 判不了**。
+
+    🔴 为什么不能吞成 `False`：解码失败、路径不存在、PIL 不可用、权限/内存问题……
+    这些都只是"**无法判断**"，一旦当成"**确定不是**图版页"，下游就会把一张读出
+    艺术字失败的图版页当成"漏行可疑页"上报（或反过来漏掉）。两种误判都会污染
+    后续的人工核查。本项目在 `rec_line_word_cols` 那侧已经确立"响亮失败优于静默降级"，
+    这里必须用同一套口径 —— 由调用方决定"判不了"该怎么记。
+
     `cache` 传入一个 dict 即可复用结果（同一页在多处扫描时只算一次）。
-    cache 的 key 会做**绝对路径归一化** —— 否则 `./pages/a.png` 与
-    `pages/a.png` 会被当成两个条目，缓存形同虚设。
+    cache 的 key 做**绝对路径归一化**，否则 `./pages/a.png` 与 `pages/a.png` 会被当成
+    两个条目，缓存形同虚设。
     """
     key = os.path.normcase(os.path.abspath(str(png_path)))
     if cache is not None and key in cache:
         return cache[key]
     from PIL import Image
     try:
-        g = np.asarray(Image.open(png_path).convert("L"))
-        val = bool((g < FIG_INK_GRAY_CUT).mean() > ink_thresh)
+        with Image.open(png_path) as im:
+            g = np.asarray(im.convert("L"))
+        val: Optional[bool] = bool((g < FIG_INK_GRAY_CUT).mean() > ink_thresh)
     except Exception:
-        val = False
+        val = None                     # 判不了 ≠ 不是
     if cache is not None:
         cache[key] = val
     return val
@@ -71,16 +90,44 @@ def xywh(box) -> Tuple[float, float, float, float]:
 # ③ 落盘：**原子写**是全局约定（半截文件绝不能留给下游）
 # ---------------------------------------------------------------------------
 def atomic_write_bytes(path: Union[str, Path], data: bytes) -> None:
-    """原子写二进制：先写 `<名>.tmp` 再 `os.replace`。
+    """原子写二进制：先写**唯一名**临时文件，再 `os.replace`。
 
     ⚠️ 为什么不能省：半截 JSON 的危害不是"多一个坏文件"，而是**下游可能把它当合法产物**。
     本项目所有写盘（页图、产物、清单）都走这里，口径只写一份。
+
+    ⚠️ 临时文件名**必须唯一**（pid + 线程 id）：固定名 `<名>.tmp` 在两个进程同时写同一
+    路径时会互相覆盖对方的临时文件，`os.replace` 的原子性只保证"要么旧的要么新的"，
+    保证不了"新的完整"。真正防并发靠**输出目录锁**（`OutputLock`，各阶段入口都在用），
+    唯一名是第二道保险 —— 锁没覆盖到的地方（例如库被直接调用）也不会写坏。
+
+    ⚠️ Windows 特例：`os.replace` 在**目标文件正被别的句柄打开**时会抛 `PermissionError`
+    （读方并发读就会触发，实测踩到）。这不是数据问题，所以这里有**有界重试**；
+    重试耗尽仍原样抛出 —— 不吞异常，读方该看到的失败照旧看得到。
+
+    ⚠️ 反向也成立：写方正在 `os.replace` 的那一瞬间，**读方 `open()` 也可能被拒**
+    （ERROR_ACCESS_DENIED）。所以本项目的读方若可能与写方并发，必须容忍这个瞬时失败。
+    正常用法是各阶段入口的输出目录锁把读写错开，不是让每个读点自己重试。
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, p)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        for attempt in range(REPLACE_RETRIES):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                if attempt == REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(REPLACE_RETRY_SLEEP)
+    except BaseException:
+        # 失败时别把半截临时文件留在目录里（下游的 glob 迟早会扫到它）。
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def atomic_write_text(path: Union[str, Path], text: str) -> None:
@@ -120,6 +167,10 @@ def dumps_product_json(doc: Dict[str, Any], indent: int = 1) -> str:
     实现：先把这些数组换成哨兵字符串，整体序列化后再原样替换回紧凑 JSON。
     哨兵含 NUL（OCR 字符表里 NUL 是 blank，永远不会出现在输出文本里），
     且比较的是**转义后**的形式，所以不会误伤正文。
+
+    ⚠️ 这是个**格式 hack**，不是普通 `json.dumps()`：它依赖"正文里不会出现哨兵那样的
+    转义序列"。所以末尾带**自校验**（见下），一旦哪天不成立就**拒绝落盘**而不是写出
+    一份被悄悄改坏的产物。
     """
     holders: Dict[str, str] = {}
     out: Dict[str, Any] = dict(doc)
@@ -151,8 +202,23 @@ def dumps_product_json(doc: Dict[str, Any], indent: int = 1) -> str:
         out["dropped_lines"] = drops2
 
     s = json.dumps(out, ensure_ascii=False, indent=indent)
+
+    # ---- 自校验：这个 hack 一旦失效，产物会被**安静地改坏**，必须挡住 ----
     for k, v in holders.items():
+        if k not in s:
+            raise RuntimeError(
+                f"紧凑序列化失败：哨兵 {k!r} 没有出现在中间产物里（本函数内部 bug）")
         s = s.replace(k, v)
+    # 逐值对账：把紧凑结果解析回来，必须与"直接 json.dumps"的语义**完全一致**。
+    # 只验"能解析"是不够的 —— 哨兵被正文里的同形转义序列误伤时，JSON 依然是合法的。
+    try:
+        if json.loads(s) != json.loads(json.dumps(doc, ensure_ascii=False)):
+            raise RuntimeError("紧凑序列化后内容与原文不一致")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"紧凑序列化后无法解析（产物已损坏，拒绝落盘）：{type(e).__name__}: {e}") from e
     return s
 
 
@@ -199,6 +265,10 @@ def image_drift(prov, png: Union[str, Path]) -> Optional[str]:
 
     ⚠️ 不这么做就会静默交付过期产物：只判"JSON 能解析"的话，
     重渲染页图后重跑 OCR 会**整本跳过**，而产物里还是旧页的文本。
+
+    🔴 **页图不存在也返回非 None**（`"页图不存在：..."`）。旧实现这里返回 `None`，
+    而调用方普遍把 `None` 读成"一致"——于是一张**缺失**的页图会被当成"产物没问题"，
+    正好绕过整个过期守卫。`None` 只表示一件事：**比过了，且一致**。
     """
     if not isinstance(prov, dict):
         return "产物没有 provenance"
@@ -207,7 +277,7 @@ def image_drift(prov, png: Union[str, Path]) -> Optional[str]:
     try:
         st = Path(png).stat()
     except OSError:
-        return None                      # 页图不在 → 由调用方另行报"缺页面图"
+        return f"页图不存在：{png}"
     if int(prov.get("png_bytes") or -1) != int(st.st_size):
         return f"页图字节数变了（{prov.get('png_bytes')} → {st.st_size}）"
     if prov["png_sha256"] != file_sha256(png):
@@ -384,13 +454,17 @@ def ocr_fingerprint(cfg_path: Optional[Union[str, Path]] = None, alts: bool = Tr
 
     ⚠️ 历史坑二：`--backend` 原来**没有进指纹** —— 配置里写 openvino，同一条命令加
     `--backend onnxruntime` 仍被判"可复用"，产物无法回答"这页到底是哪个后端跑的"。
-    现在 `backend_override` 显式记录 CLI 取值，`backend` 记录**生效值**。
+    现在三个键分开记，审计时能区分"配置要求什么"和"本次实际用了什么"：
+      · `backend_config`   —— 配置文件里写的（本次没读配置时为 None）
+      · `backend_override` —— CLI 原值（`auto` 表示没覆盖）
+      · `backend`          —— **本次实际生效**的（override 生效后）
+    比较只认 `backend`，但另外两个留着让 provenance 自解释。
 
     ⚠️ 必须能在**没有引擎**时算出来：预检阶段若比不了，就会出现"预检说全部可复用 →
     直接 return 0"，根本没机会比引擎参数。
 
     ⚠️ `det_boxes_source` 也进指纹：`raw` 与 `filtered` 的产物**审计能力不同**，
-    不能互相复用（filtered 的产物 `linefix.audit` 结构性失明）。
+    不能互相复用（filtered 的产物会让漏行审计结构性失明）。
     """
     c = cfg_path or default_config_path()
     override = (backend or "auto").strip().lower()
@@ -400,8 +474,12 @@ def ocr_fingerprint(cfg_path: Optional[Union[str, Path]] = None, alts: bool = Tr
                            "top2_floor": top2_floor if alts else None,
                            "top2_decimals": top2_decimals if alts else None,
                            "det_boxes_source": det_boxes_source,
-                           "backend_override": override}
+                           "backend_config": None,
+                           "backend_override": override,
+                           "backend": None}
     out.update(_versions())
+    if override not in ("auto", "", "default"):
+        out["backend"] = override
     if not c:
         out["_cfg_error"] = f"找不到配置文件（{DEFAULT_CONFIG_REL}）"
         return out
@@ -410,24 +488,38 @@ def ocr_fingerprint(cfg_path: Optional[Union[str, Path]] = None, alts: bool = Tr
         cfg_obj = ParseParams().load(str(c))
         out.update(_fingerprint_from_cfg_obj(cfg_obj))
         out["model_sha256"] = _model_files(cfg_obj)
+        out["backend_config"] = out["backend"]          # 配置里写的
         if override not in ("auto", "", "default"):
-            # 生效后端 = CLI 覆盖值（build_engine 会在三段上强制覆盖）
-            out["backend"] = override
+            out["backend"] = override                   # 实际生效的
     except Exception as e:
         # 解析不出来**绝不猜参数**：猜出来的指纹会让复用判据给出错误结论
-        # （"看着一致"其实没比到）。调用方见到 `_cfg_error` 必须**拒绝运行**，
-        # 而不是降级 —— 见 pipeline/ocr.py。
+        # （"看着一致"其实没比到）。这里只如实标记 `_cfg_error`；
+        # **由 `fingerprint_drift()` 保证它一定被算作"不可复用"** ——
+        # 标记一个 `_` 前缀的错误键然后让人忽略它，等于没有 fail closed。
         out["_cfg_error"] = f"{type(e).__name__}: {e}"
     return out
 
 
 def fingerprint_drift(stored, want: Dict[str, Any]) -> List[str]:
-    """逐键比对指纹，返回差异说明（空列表 = 一致）。只比 `want` 里出现的键。"""
+    """逐键比对指纹，返回差异说明（空列表 = 一致）。只比 `want` 里出现的键。
+
+    🔴 **fail closed**：`want` 里只要有 `_` 前缀的键（如 `_cfg_error`），一律判为
+    "不一致"，并把它当成差异原因返回。
+
+    为什么必须这样：原来这些 `_` 键在比对时被**跳过**，于是"指纹算不出来"会退化成
+    "指纹一致" —— 缓存命中一个**从来没比过**的口径，旧产物被当成新的继续往下跑。
+    这比"多比了一轮"危险得多：它让整个过期守卫静默失效。
+    ⇒ 只返回非空的比对结果，调用方不可能把它误读成"可以复用"。
+    """
+    if not isinstance(want, dict):
+        return ["指纹不是字典（内部 bug）"]
+    errs = [(k, v) for k, v in want.items() if str(k).startswith("_")]
+    if errs:
+        detail = "；".join(f"{k}: {v}" for k, v in errs)
+        return [f"指纹无法计算 → 一律判为不可复用（{detail}）"]
     stored = stored or {}
     out: List[str] = []
     for k, v in want.items():
-        if k.startswith("_"):
-            continue
         got = stored.get(k, "<缺>")
         if got != v:
             out.append(f"{k}: {got!r} → {v!r}")

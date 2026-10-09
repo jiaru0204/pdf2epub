@@ -873,7 +873,8 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
     n_fig_empty: List[str] = []      # 同上，但判为图版页 → 艺术字 rec 空属预期，不算信号
     n_empty: List[str] = []          # det 也无框（空白页/纯图页）
     n_drop_text: List[str] = []      # 丢弃行里有非空文本 —— 真内容被 text_score 滤掉
-    fig_cache: Dict[str, bool] = {}
+    fig_cache: Dict[str, Optional[bool]] = {}
+    n_fig_unknown: List[str] = []    # 图版页判据**判不了**（解码失败等）—— 不是"不是图版页"
     interrupted = False
 
     for k, name in enumerate(names, 1):
@@ -970,8 +971,14 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
         if not lines and det_boxes:
             # 先判图版页再报"可疑"：图版页的艺术字 rec 必然空，那是预期不是漏行。
             # 只在这种情况下才解码 PNG，所以正常页不付这个成本。
-            if C.is_figure_page(png, cache=fig_cache):
+            # ⚠️ `is_figure_page` 返回 Optional[bool]：`None` = **判不了**（解码失败等），
+            #    必须单独成类 —— 当成 False 会把一张读不出来的图版页误报成"漏行可疑"，
+            #    当成 True 又会把真漏行藏起来。两者都是在编造结论。
+            fig = C.is_figure_page(png, cache=fig_cache)
+            if fig is True:
                 n_fig_empty.append(name)
+            elif fig is None:
+                n_fig_unknown.append(name)
             else:
                 n_norec.append(name)
         elif not lines and not det_boxes:
@@ -1033,6 +1040,10 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
     if n_fig_empty:
         print(f"\nℹ {len(n_fig_empty)} 页「有框无行」但判为图版页（艺术字 rec 空属预期，"
               f"不是漏行信号）：{', '.join(n_fig_empty[:8])}")
+    if n_fig_unknown:
+        print(f"\n⚠ {len(n_fig_unknown)} 页「有框无行」且**图版页判据判不了**"
+              f"（页图无法解码/读取）—— 既不能算漏行也不能算预期，请先确认页图本身："
+              f"{', '.join(n_fig_unknown[:8])}")
     if n_empty:
         print(f"\nℹ {len(n_empty)} 页 det 无框（空白页/纯图页，正常）：{', '.join(n_empty[:8])}")
 
@@ -1070,6 +1081,7 @@ def _run(args, pages_dir: Path, out_dir: Path, cfg_path: Path, names: List[str],
                      "det_line_diff": n_diff, "elapsed_sec": round(elapsed_all, 1)},
         "book": book,
         "suspect_no_rec": n_norec, "figure_pages_empty": n_fig_empty,
+        "figure_judgement_unknown": n_fig_unknown,
         "empty_pages": n_empty, "dropped_with_text": n_drop_text,
         "pages": [merged[k] for k in sorted(merged)],
     })
