@@ -43,6 +43,15 @@
   （过滤只删不重排不改坐标，所以必须逐值相等；下标有偏差必然失败）。
 - `det_boxes` = **过滤前的原始 det 框**。`result.boxes` 与 `result.txts` 永远 1:1，**不能**当原始框用。
 - `provenance.audit_capable=False` 表示这是 `--allow-filtered-det` 降级产物，下游**必须拒绝审计**。
+- 🆕 **`lines[].role`**（`PRODUCT_SCHEMA` **6**）：`"text"` / `"page_number"`。印刷页码行
+  **只打标记、不删除** —— 删了漏行审计会把页码框误报成「有框无行」。判据
+  `linefix.common.page_number_role()` **只写一份**：整行 1~4 位纯数字 ∧ `y/页高 > 0.85`。
+  全书实测 **363 行**判为页码；🔴 **正文区另有 4 行纯数字不是页码**
+  （`page_336` 的 `99` 其实是 `——”` 被误识）→ 别按「整行是数字」自己过滤。
+  下游取正文：`[l for l in lines if l["role"] != "page_number"]`。
+- 跑单页：`--pages-filter page_150 --force`。已有产物补 `role` 用
+  `scripts/backfill_line_role.py`（纯函数补写，已验证与真正重跑**逐字段一致**）。
+- 评测脚本也读同一份判据；页高改成逐页读 PNG 头（**不再硬编码 2335**）。
 - 版本闸门 `SUPPORTED_RAPIDOCR = ("3.9.2",)`：hook 的是 rapidocr 内部 API，未验证版本 exit 2。
 - 埋点（`--alts` 默认开）**不**降级：钩子装不上 → exit 1，要关必须显式 `--no-alts`。
 - 口径指纹（`check_reusable`）含：runtime 版本 + 权重实际 SHA256 + backend（含 `--backend` 覆盖）
@@ -77,11 +86,36 @@
   前置页（版权/CIP）对不上，做逐字评测要排除。
 - 已知薄弱位（真实书实测）：**引号 `”`、单个数字/符号**（8 条低 conf 里占 6 条）。
 
+## 评测（`scripts/ocr_accuracy_report.py` → `docs/ocr-accuracy-围城.md`）
+- 三桶：**正文页 313** / 脚注页 46 / 前置·后置页 5（另 4 页锚定失败）。
+- 正文页：**N1 剔页码 0.500%（99.500%）**｜N2 0.438%｜**汉字-only 0.143%（99.857%）**。
+  逐页中位 0.286% / 90 分位 1.094% / 最差 2.455%（`page_285`），**无页 > 3%**。
+- 🔴 对齐**不能用**「页内中段探针反推页首」：反推式隐含「OCR 偏移 == 参考偏移」，
+  丢字就偏右 → 把本页文字判成「插入」（`page_093` 偏 2 字、`page_285` 偏 10 字）。
+  正确做法：**页面开头 48 字直接锚定**（精确→模糊→吸附）+ **终点 = 下一页起点**；
+  4 项自检（锚定方式 / 起点单调性 / 平移敏感度 / 参考段长 vs OCR 页长）。
+- 🔴 差异归因（1057 字符）：**整段删除 644（`—` 占 472）** + 汉字↔汉字 182 + 整段插入 24。
+  破折号 638 组 `——` 只剩 244 组、单 `—` 229 个 → **CTC 重复字符塌缩，结构性缺陷**。
+  引号丢失 164（`‘`106 / `”`36 / `’`22），而 `“` 完全无损 → 是「小标记 + 行首尾位置」问题。
+- 对照 txt 与 PDF **版次不同**（2005 重印 vs 2017）+ 脚注编码不同 → 这两类页必须单列。
+- ⚠️ `docs/archive/ocr-accuracy-围城-v1.md` 是**已作废**的历史快照，别引用其数字。
+
+## 下一步（尚未做）
+- P1 **破折号修复**：规范化规则（中文规范即 `——`，本书单 `—` 仅 6/1282）
+  or CTC 列宽证据（`char_x_spans_from_cols`）or 换 attention decoder —— **待选**。
+- P2 引号：det 框外扩 + 首末行 padding 二次识别 / 配对状态机。
+- P3 脚注页 46 页整桶排除使覆盖率仅 85% → 市面用**元素级**评测可提到 ~97%。
+- P4 形近字 182（`己`↔`已` 等）：⚠️ MacBERT4CSC 已证伪（净损 −660），方向是
+  LLM 后纠（只裁决"提议改动"、按阈值批量）或混淆集 + 语言模型重打分。
+- 纠错层 `linefix/{audit,rescue,recheck}.py` **尚未移植**。
+
 ## 例行核验
 - 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（35 项）
 - 共用层：`.venv/Scripts/python.exe .tmp/test_common_review.py`（73 项）
 - 拆页：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项）
 - OCR：`.venv/Scripts/python.exe .tmp/test_ocr_review.py`（98 项）
+- 评测报告：`.venv/Scripts/python.exe scripts/ocr_accuracy_report.py`
+- 新对话接手入口：**`docs/HANDOFF.md`**（现状 / 待决策 / 坑点 / 文件地图）
 
 
 
