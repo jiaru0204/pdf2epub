@@ -57,7 +57,7 @@ ANCHOR_LEN = 48                     # 页首锚串长度（精确匹配用）
 ANCHOR_LADDER = (48, 40, 32, 24, 16, 10)   # 精确匹配的逐级回退长度
 ANCHOR_FUZZY_LEN = 96               # 模糊兜底时取页面开头多少字
 ANCHOR_FUZZY_MIN = 60               # 模糊兜底的相似度下限
-SLIDE_RANGE = 24                    # 对齐质量自检：参考窗口平移 ±N 字
+SLIDE_RANGE = 40                    # 对齐质量自检：参考窗口平移 ±N 字
 SLIDE_STEP = 2
 CJK = re.compile(r"[\u4e00-\u9fff]")
 REF_FOOTNOTE = re.compile(r"\[\d+\]")                        # 对照文本的脚注标记写法
@@ -377,6 +377,7 @@ def main() -> int:
 
     # 「剔除印刷页码行」口径：只改 hypothesis（参考文本本来就没有页码）
     N1 = jiwer.process_characters([x["seg"] for x in clean], [x["hyp_np"] for x in clean])
+    N2 = jiwer.process_characters([n2(x["seg"]) for x in clean], [n2(x["hyp_np"]) for x in clean])
     NC = jiwer.process_characters([cjk_only(x["seg"]) for x in clean],
                                  [cjk_only(x["hyp_np"]) for x in clean])
     # 全书页码行统计（含未锚定页）
@@ -395,9 +396,11 @@ def main() -> int:
     DC = jiwer.process_characters([cjk_only(x["seg"]) for x in dirty] or [""],
                                   [cjk_only(x["hyp"]) for x in dirty] or [""])
 
+    # ⚠️ 统一用「剔除页脚区页码行」后的口径 —— 与 1.1 主口径一致。
+    #    否则「最差页」排名里会混进页码行造成的插入，与报告表头的口径自相矛盾。
     per_page = []
     for x in clean:
-        s = jiwer.process_characters(n2(x["seg"]), n2(x["hyp"]))
+        s = jiwer.process_characters(n2(x["seg"]), n2(x["hyp_np"]))
         per_page.append((x["name"], s.cer, len(n2(x["seg"])),
                          s.substitutions, s.deletions, s.insertions))
     per_page_bad = sorted(per_page, key=lambda t: -t[1])
@@ -421,7 +424,7 @@ def main() -> int:
 
     write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
                  R1, R2, RC, C1, C2, CC, D1, DC,
-                 N1, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
+                 N1, N2, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
                  ins_chars, page_like, sample, ref_n1, slide)
     print("报告 ->", REPORT)
     return 0
@@ -429,7 +432,7 @@ def main() -> int:
 
 def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
                  R1, R2, RC, C1, C2, CC, D1, DC,
-                 N1, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
+                 N1, N2, NC, pn_stat, per_page, per_page_bad, cat, cat_dirty, del_chars,
                  ins_chars, page_like, sample, ref_n1, slide):
     idx = {x["name"]: i for i, x in enumerate(aligned)}
     cers = sorted(x[1] for x in per_page)
@@ -608,6 +611,7 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
     A("|---|---|")
     A(f"| N1 CER | **{pct(N1.cer)}** |")
     A(f"| **N1 准确率** | **{pct(1 - N1.cer)}** |")
+    A(f"| N2 CER | **{pct(N2.cer)}** |")
     A(f"| 汉字 CER | **{pct(NC.cer)}** |")
     A(f"| **汉字准确率** | **{pct(1 - NC.cer)}** |")
     A(f"| 替换 / 删除 / 插入 | {N1.substitutions} / {N1.deletions} / {N1.insertions} |")
@@ -627,7 +631,7 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
     A(f"> - **前置/后置页（{len(front)} 页）不参与任何指标**：与对照文本版次不同（见 0.1、0.6）。"
       f"若强行比对其 N1 CER 为 {pct(F1.cer)}，那是版次差异、不是识别质量。\n")
 
-    A("\n## 2. 逐页 CER 分布（正文页，N2 口径）\n")
+    A("\n## 2. 逐页 CER 分布（正文页；N2 口径 + 已剔除页脚区页码行）\n")
     A("| 分位 | 页 CER |")
     A("|---|---|")
     for label, p in (("最好 25%", 0.25), ("中位数", 0.5), ("75%", 0.75),
@@ -645,8 +649,8 @@ def write_report(pages, aln, aligned, clean, dirty, front, body_a, body_b,
     n = buckets.get(9, 0)
     A(f" ≥10% {bar(buckets.get(9,0)/len(cers))} {n:4d} 页")
     A("```\n")
-    A("**最差的 10 页**（正文页里，优先人工复核；页边界已通过 0.5 的自检，"
-      "下面的排名**不含对齐噪声**）：\n")
+    A("**最差的 10 页**（正文页，已剔除页脚区页码行；页边界经 0.5 的自检，"
+      "排名**不含对齐噪声**）：\n")
     A("| 页 | CER | 参考长度 | 替换 | 删除 | 插入 |")
     A("|---|---|---|---|---|---|")
     for nm, cer, ln_, su, de, ins in per_page_bad[:10]:
