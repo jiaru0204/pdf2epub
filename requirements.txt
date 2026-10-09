@@ -1,0 +1,33 @@
+# 本项目依赖声明
+#
+# 重建环境：
+#   python -m venv .venv
+#   .venv/Scripts/python.exe -m pip install -r requirements.txt
+#
+# 自检：
+#   .venv/Scripts/python.exe scripts/check_rapidocr_env.py   # OCR 环境
+#
+# ⚠️ openvino 必须单独列出：rapidocr 3.x **不把推理后端作为依赖**（也没有 extras），
+#    只装 rapidocr 会在运行时抛 `ImportError: xxx is not installed.`。
+#    本项目固定用 OpenVINO（CPU），比 onnxruntime 快约 2×，输出逐字一致。
+#    🔴 **绝对不要装 onnxruntime** —— 保持"未安装"状态才能证明推理确实走 openvino
+#    （装了就有静默回退空间，配置里写 openvino 也可能实际跑在 onnxruntime 上）。
+
+# ---- 直接依赖 ----
+rapidocr==3.9.2          # OCR 引擎（本项目禁用 cls，见 configs/rapidocr_openvino_ppocrv6_medium.yaml）
+openvino==2026.4.1       # 推理后端（CPU）
+pymupdf==1.28.2          # PDF 渲染（pipeline/split_pages.py）
+                         # ⚠️ AGPL-3.0：内部产 EPUB 一般没问题；若要对外分发本工具，
+                         #    换 pypdfium2（Apache-2.0）只需改 render_page() / renderer_tag() 两处，
+                         #    但渲染像素会变，与既有产物的 bbox 不再逐位可比。
+                         # ⚠️ 版本敏感：pixmap_size() 依赖 pymupdf 的取整行为（ceil），换版本要重跑回归矩阵。
+numpy==2.5.3
+pillow==12.3.0
+opencv-python==5.0.0.93  # 图像 IO
+
+# ---- 传递依赖（由 rapidocr 带入；一并锁死以防版本漂移）----
+omegaconf==2.3.1
+requests==2.34.2
+shapely==2.2.0
+six==1.17.0
+tqdm==4.70.1

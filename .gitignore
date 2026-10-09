@@ -1,0 +1,41 @@
+# ---- 虚拟环境（自带 PP-OCRv6 medium 权重 det 59MB + rec 73MB，整包约 620MB）----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Python 缓存与构建产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 本书数据与中间产物（体积大、与具体书绑定）----
+# pages/
+# textlines*/
+# *.epub
+# *.pdf
+
+# ---- 临时文件 ----
+.tmp/
+*.tmp
+*.log
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+
+# ---- 凭据（永不入库）----
+.env
+*.key
+*.pem
+credentials.json
+
+# 说明：`.workbuddy/` 刻意**不**忽略 —— 它是本项目的长期记忆与技能笔记，
+#       属于项目资产而非缓存，需要随代码一起版本化。
