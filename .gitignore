@@ -13,10 +13,12 @@ __pycache__/
 .ruff_cache/
 
 # ---- 本书数据与中间产物（体积大、与具体书绑定）----
-# pages/
-# textlines*/
-# *.epub
-# *.pdf
+# 已按需放开：全盘跑起来后 pages/ 约 200MB/本、textlines/ 若干 MB，绝不入库。
+pages/
+textlines/
+textlines*/
+det_reconcile/
+*.epub
 
 # ---- 临时文件 ----
 .tmp/
