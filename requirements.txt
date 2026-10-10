@@ -26,6 +26,9 @@ pillow==12.3.0
 opencv-python==5.0.0.93  # 图像 IO
 
 # ---- 传递依赖（由 rapidocr 带入；一并锁死以防版本漂移）----
+# ⚠️ PyYAML 虽由 rapidocr 带入，但 pipeline/ocr.py 的 peek_config() 直接 import yaml，
+#    属于直接依赖，必须自己锁版 —— 不能指望上游永远带着它。
+PyYAML==6.0.3
 omegaconf==2.3.1
 requests==2.34.2
 shapely==2.2.0
@@ -37,3 +40,5 @@ tqdm==4.70.1
 #   → 用 jiwer 的逐字符 Levenshtein 对齐，与 orign_pdf/围城.txt 对照，
 #     产出 docs/ocr-accuracy-围城.md
 jiwer==4.0.0
+rapidfuzz==3.14.6        # ocr_accuracy_report.py 直接 import（模糊锚定）；jiwer 只声明 >=3.9.7 不锁上界
+click==8.5.0             # jiwer 带入，一并锁死

@@ -21,6 +21,7 @@ det_reconcile/
 *.epub
 
 # ---- 临时文件 ----
+# 注意：回归测试脚本在 tests/（已入库）；.tmp/ 只放测试运行时产生的临时数据。
 .tmp/
 *.tmp
 *.log

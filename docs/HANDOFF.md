@@ -1,7 +1,7 @@
 # 交接文档（2026-10-09 深夜）
 
 > 用途：给**新对话**快速接手。看完这一份 + 项目记忆 `.workbuddy/memory/MEMORY.md` 就能继续干。
-> 当前 HEAD：`dccfefd`（工作区干净）
+> 当前 HEAD 以 `git log -1 --oneline` 为准（此处不写死，避免文档与仓库漂移）。
 
 ---
 
@@ -38,7 +38,7 @@
 
 ```bash
 # 解释器：项目内 .venv（不是 .env）—— rapidocr 3.9.2 + OpenVINO + PP-OCRv6 medium
-.venv/Scripts/python.exe scripts/check_rapidocr_env.py        # 环境自检 35 项
+.venv/Scripts/python.exe scripts/check_rapidocr_env.py        # 环境自检 34 项
 
 # 产线第一环：拆页
 .venv/Scripts/python.exe -m pipeline.split_pages --pdf orign_pdf/围城.pdf
@@ -49,10 +49,10 @@
 # 评测报告（读 orign_pdf/textlines/，重算 docs/ocr-accuracy-围城.md）
 .venv/Scripts/python.exe scripts/ocr_accuracy_report.py
 
-# 回归（都在 .tmp/，不进库）
-.venv/Scripts/python.exe .tmp/test_common_review.py           # 73 项
-.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py      # 83 项
-.venv/Scripts/python.exe .tmp/test_ocr_review.py              # 98 项
+# 回归（tests/ 下，已入库；测试产生的临时数据仍落在 .tmp/）
+.venv/Scripts/python.exe tests/test_common_review.py          # 73 项
+.venv/Scripts/python.exe tests/test_split_pages_matrix.py     # 83 项
+.venv/Scripts/python.exe tests/test_ocr_review.py             # 98 项
 ```
 
 🔴 **单次后台调用超过约 10 分钟会被静默回收** → OCR 必须 `--max-minutes 9` 分批续跑。
@@ -188,9 +188,13 @@ D:\Project\pdf2epub\
 │   ├── common.py               # 共用实现层（判据/几何/IO/指纹/OutputLock）
 │   └── __init__.py
 ├── scripts\
-│   ├── check_rapidocr_env.py       # 环境自检 35 项
+│   ├── check_rapidocr_env.py       # 环境自检 34 项
 │   ├── ocr_accuracy_report.py      # 评测 → docs/ocr-accuracy-围城.md
-│   └── backfill_line_role.py       # 一次性迁移：补 lines[].role（schema 5→6）
+│   └── backfill_line_role.py       # 一次性迁移：补 lines[].role（schema 5→6，已执行完毕，仅留档）
+├── tests\
+│   ├── test_common_review.py       # 共用层回归 73 项
+│   ├── test_split_pages_matrix.py  # 拆页回归 83 项
+│   └── test_ocr_review.py          # OCR 回归 98 项（临时数据落 .tmp/）
 ├── docs\
 │   ├── HANDOFF.md                  # 本文档
 │   ├── ocr-accuracy-围城.md        # 现行评测报告（以此为准）

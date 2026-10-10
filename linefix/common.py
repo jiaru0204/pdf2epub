@@ -69,13 +69,20 @@ MIN_BOX_H_ABS = 10
 
 
 class Line(TypedDict, total=False):
-    """产物里的一行文本。前四项是既有约定，后两项是救援阶段新增。"""
+    """产物里的一行文本。
+
+    前四项是既有约定；`orig_line_id` / `added` 是救援阶段新增；
+    `det_index` / `role` / `top2` 是 PRODUCT_SCHEMA 5/6 起 OCR 产物携带的字段。
+    """
     line_id: int                 # 当前产物空间的行号（1..n）
     bbox: List[float]            # [x, y, w, h]，**原图坐标**
     text: str
     confidence: Optional[float]
     orig_line_id: Optional[int]  # 重排前它在**源产物**里的行号；新增行=None
     added: bool                  # 是否为救援时新插入的行
+    det_index: Optional[int]     # 该行归属的 det_boxes 下标（证据归属的唯一依据）
+    role: str                    # "text" / "page_number"（页码只打标记、不删除）
+    top2: list                   # 逐字 top-2 概率证据 [[i, t, p1, c2, p2], ...]（稀疏，按下标 i 定位）
 
 
 # ---------------------------------------------------------------------------

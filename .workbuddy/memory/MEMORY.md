@@ -115,10 +115,11 @@
 - 纠错层 `linefix/{audit,rescue,recheck}.py` **尚未移植**。
 
 ## 例行核验
-- 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（35 项）
-- 共用层：`.venv/Scripts/python.exe .tmp/test_common_review.py`（73 项）
-- 拆页：`.venv/Scripts/python.exe .tmp/test_split_pages_matrix.py`（83 项）
-- OCR：`.venv/Scripts/python.exe .tmp/test_ocr_review.py`（98 项）
+- 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（34 项，字体缺失改 SKIP 不计失败）
+- 共用层：`.venv/Scripts/python.exe tests/test_common_review.py`（73 项）
+- 拆页：`.venv/Scripts/python.exe tests/test_split_pages_matrix.py`（83 项）
+- OCR：`.venv/Scripts/python.exe tests/test_ocr_review.py`（98 项）
+  （2026-10-10 起测试脚本移到 `tests/` 并**入库**；测试临时数据仍落 `.tmp/`）
 - 评测报告：`.venv/Scripts/python.exe scripts/ocr_accuracy_report.py`
 - 新对话接手入口：**`docs/HANDOFF.md`**（现状 / 待决策 / 坑点 / 文件地图）
 

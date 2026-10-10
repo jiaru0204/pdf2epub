@@ -125,9 +125,7 @@ def check_weights(ocr) -> None:
     root = Path(str(ocr.cfg.Global.model_root_dir))
     for section_name in ("Det", "Cls", "Rec"):
         cfg = getattr(ocr.cfg, section_name)
-        if section_name == "Cls" and not ocr.cfg.Global.use_cls:
-            # use_cls=false 时 TextClassifier 仍会被构造并加载权重，所以同样必须核对
-            pass
+        # 注意：use_cls=false 时 TextClassifier 仍会被构造并加载权重，所以 Cls 同样必须核对
         info = InferSession.get_model_url(
             FileInfo(
                 engine_type=cfg.engine_type,
@@ -150,15 +148,36 @@ def check_weights(ocr) -> None:
         )
 
 
+def find_cjk_font() -> Path | None:
+    """在常见位置找一个中文字体；找不到返回 None（端到端段跳过，不算失败）。
+
+    ⚠️ 不能写死 `C:/Windows/Fonts/msyh.ttc`：那只是"本机恰好有"，换台 Windows
+    （或精简版系统）就可能没有，自检不该因此报 FAIL —— 字体不是本项目的依赖。
+    """
+    candidates = [
+        "C:/Windows/Fonts/msyh.ttc",      # 微软雅黑
+        "C:/Windows/Fonts/simhei.ttf",    # 黑体
+        "C:/Windows/Fonts/simsun.ttc",    # 宋体
+        "C:/Windows/Fonts/Deng.ttf",      # 等线
+    ]
+    for c in candidates:
+        p = Path(c)
+        if p.is_file():
+            return p
+    return None
+
+
 # ---------------------------------------------------------------- 5. 端到端
 def check_end_to_end() -> None:
     section("5. 端到端（合成中文图 -> det -> rec）")
 
     from PIL import Image, ImageDraw, ImageFont
 
-    font_path = Path("C:/Windows/Fonts/msyh.ttc")
-    if not check("中文字体存在", font_path.is_file(), str(font_path)):
+    font_path = find_cjk_font()
+    if font_path is None:
+        print("  [SKIP] 未找到中文字体，跳过端到端段（字体不是本项目的依赖）")
         return
+    print(f"  使用字体: {font_path}")
 
     lines = ["爱尔兰神话全书", "OCR 环境核验 PP-OCRv6 medium", "检测与识别均使用 OpenVINO"]
     img = Image.new("RGB", (900, 240), "white")
