@@ -244,7 +244,7 @@ D:\Project\pdf2epub\
 │   ├── ocr-accuracy-围城.md        # 现行评测报告（以此为准）
 │   └── archive\ocr-accuracy-围城-v1.md   # 已封存的历史快照（数字已作废）
 ├── orign_pdf\
-│   ├── 围城.pdf / 围城.txt         # 源书 + 原文对照文本（版次不同！）
+│   ├── 围城.pdf / 围城.txt         # 源书 + 原文对照文本（版次不同！**不入库、不进历史**，见 .gitignore）
 │   ├── pages\                     # 368 张 PNG（56MB，不入库）
 │   ├── textlines\                 # 368 个 OCR 产物 + ocr_manifest.json（不入库）
 │   └── linefix\                   # audit/rescue 产物（不入库）

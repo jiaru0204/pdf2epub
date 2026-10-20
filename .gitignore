@@ -25,6 +25,14 @@ det_reconcile/
 **/linefix/recheck/
 *.epub
 
+# ---- 源书原文（受版权保护，**绝不入库**）----
+# 仓库是公开的，源 PDF 与对照文本（整本书）不能进版本库。
+# 2026-10-20 已用 filter-branch 把它们从**全部历史**里剔除；本机仍保留在 orign_pdf/ 下
+# 供复跑，git 看不见。换书复跑时请自备源文件放到同一位置。
+orign_pdf/*.pdf
+orign_pdf/*.txt
+orign_pdf/*.epub
+
 # ---- 纠错层 / 评测的派生数据（可由产物重跑得到；台账与报告入库）----
 # score_glyph 把清单写在 `<products>/../`，review_sheet 默认写 eval/*.png。
 review_book.json
