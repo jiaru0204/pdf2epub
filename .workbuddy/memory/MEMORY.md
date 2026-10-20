@@ -1,15 +1,33 @@
 # pdf2epub 项目长期约定
 
 > **接手请先读 `docs/HANDOFF.md`**（现状 / 待决策 / 坑点 / 文件地图）。
-> 当前 HEAD `d863af6`。产线前两环（拆页 → OCR）已在《围城》368 页全盘跑通；
-> 评测报告 `docs/ocr-accuracy-围城.md`（正文页 N1 剔页码 **0.500%**、汉字 **0.143%**）；
-> **下一步 P1 = 修破折号 `——`→`—`（CTC 结构性塌缩，472 处）**；纠错层尚未移植。
+> 产线四环（拆页 → OCR → 评测 → **纠错层**）已全部就位；纠错层口径见
+> `docs/ocr-correction-design.md`。评测报告 `docs/ocr-accuracy-围城.md`
+> （正文页 N1 剔页码 **0.500%**、汉字 **0.143%**）。
+> **下一步 P1 = 修破折号 `——`→`—`（CTC 结构性塌缩，472 处）**；
+> 另需给《围城》建自己的**冻结台账**（纠错层已可跑，但台账还是《爱尔兰》的）。
 
 ## 目录（先看这条，曾经踩过）
 - **本项目 = `D:\Project\pdf2epub`**（IDE 工作区）。
-- `D:\pdf_to_epub` = **测试/参考项目**，只做参考，**不要改它**。
-- `D:\pdf2epub` = 无关的旧目录。
+- `D:\App\pdf_to_epub` = **直接前身 / 参考项目**（带纠错层），只做参考，**不要改它**。
+- `D:\App\pdf2epub` = 更早一代（《爱尔兰神话全书》时期），**只有 docs、没有可运行代码**。
 - 三者是磁盘上独立目录，没有 junction/symlink。⚠️ 别再把改动写进参考项目。
+  旧路径 `D:\pdf_to_epub` / `D:\pdf2epub` **已不存在**。
+
+## 纠错层（`linefix` + `eval`，2026-10-20 移植并适配）
+- 三环：`linefix.audit`（零推理漏行审计）→ `linefix.rescue`（行级 rec-only 救援）→
+  `linefix.recheck`（字级原图二次后验 + 结构式判定，默认只采纳「汉字→汉字」定向替换）。
+- 裁判：`eval/score_glyph.py`（覆盖率 / 阈值扫描 / 标定基线 / 全书复核清单）+ `eval/review_sheet.py`（人工复核贴图）。
+- 🔴 **判定 ≠ 采纳**：`judge` 出结论，`should_adopt` 决定写盘；**任何删除都不采纳**。
+- 🔴 **台账按书锚定**：`eval/glyph_confusion_set.json` 现在是《爱尔兰》的 34 条；
+  拿别的书产物跑会被**硬闸门 exit 2**。页名 `page_NNN` 跨书会"假装命中"，
+  **只有定位成功数可信**。建台账必须人工看原图（`docs/ocr-correction-design.md` §8）。
+- 🔴 `dropped_lines` 里多为碎片（22×20、9×16），拿**全部**丢弃行与 audit 差异对账会**假报警**；
+  只比过了 `min_w/min_h` 的。
+- 🔴 `rescue` 必须：① 让补出的行认领 `det_index`；② 补 `role`；③ **合并源 provenance**
+  （只写引擎指纹会丢 `det_boxes_source`/`top2_floor`，下次 audit 对降级产物失明）。
+- 实跑（《围城》368 页）：audit 差异 **0**；rescue W2 8 条全被拒（单字符行）；
+  recheck 40 位抽样采纳 0（正常）。全书候选约 11488 位，全量前先 `--limit` 校口径。
 
 ## OCR 环境
 - 虚拟环境固定为项目内 **`.venv`**（不是 `.env`）。解释器 `D:\python\Python\python.exe`，Python 3.13.15。
@@ -112,16 +130,21 @@
 - P3 脚注页 46 页整桶排除使覆盖率仅 85% → 市面用**元素级**评测可提到 ~97%。
 - P4 形近字 182（`己`↔`已` 等）：⚠️ MacBERT4CSC 已证伪（净损 −660），方向是
   LLM 后纠（只裁决"提议改动"、按阈值批量）或混淆集 + 语言模型重打分。
-- 纠错层 `linefix/{audit,rescue,recheck}.py` **尚未移植**。
+  ✅ 工具已就位（`linefix.recheck` + `eval/`），**只差《围城》自己的冻结台账**（要人工看原图认定）。
+- 下游五阶段（EPUB 侧）**尚未开始**。
 
 ## 例行核验
 - 环境：`.venv/Scripts/python.exe scripts/check_rapidocr_env.py`（34 项，字体缺失改 SKIP 不计失败）
 - 共用层：`.venv/Scripts/python.exe tests/test_common_review.py`（73 项）
 - 拆页：`.venv/Scripts/python.exe tests/test_split_pages_matrix.py`（83 项）
 - OCR：`.venv/Scripts/python.exe tests/test_ocr_review.py`（98 项）
+- 纠错层：`.venv/Scripts/python.exe tests/test_linefix_review.py`（79 项，含真实引擎闭环）
   （2026-10-10 起测试脚本移到 `tests/` 并**入库**；测试临时数据仍落 `.tmp/`）
+  （四份合计 333 项；2026-10-20 全部全绿）
+- 全书审计：`.venv/Scripts/python.exe -m linefix.audit --pages orign_pdf/pages --products orign_pdf/textlines`（~9s，差异应为 0）
 - 评测报告：`.venv/Scripts/python.exe scripts/ocr_accuracy_report.py`
 - 新对话接手入口：**`docs/HANDOFF.md`**（现状 / 待决策 / 坑点 / 文件地图）
+  纠错层口径：**`docs/ocr-correction-design.md`**
 
 
 

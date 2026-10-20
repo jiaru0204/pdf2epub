@@ -18,7 +18,21 @@ pages/
 textlines/
 textlines*/
 det_reconcile/
+# 纠错层输出（默认落在 `<pages>/../linefix/`，即书籍目录下）—— 用 `**/` 是为了
+# 不跟仓库根的 `linefix/` **代码包**撞名（根上写 `linefix/` 会把源码一起忽略掉）。
+**/linefix/audit/
+**/linefix/rescue/
+**/linefix/recheck/
 *.epub
+
+# ---- 纠错层 / 评测的派生数据（可由产物重跑得到；台账与报告入库）----
+# score_glyph 把清单写在 `<products>/../`，review_sheet 默认写 eval/*.png。
+review_book.json
+review_book.md
+report_glyph.json
+recheck_sheet*.png
+review_sheet*.png
+eval/*.png
 
 # ---- 临时文件 ----
 # 注意：回归测试脚本在 tests/（已入库）；.tmp/ 只放测试运行时产生的临时数据。

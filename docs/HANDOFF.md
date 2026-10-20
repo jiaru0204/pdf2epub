@@ -1,4 +1,4 @@
-# 交接文档（2026-10-09 深夜）
+# 交接文档（2026-10-20 更新）
 
 > 用途：给**新对话**快速接手。看完这一份 + 项目记忆 `.workbuddy/memory/MEMORY.md` 就能继续干。
 > 当前 HEAD 以 `git log -1 --oneline` 为准（此处不写死，避免文档与仓库漂移）。
@@ -7,9 +7,11 @@
 
 ## 0. 一句话现状
 
-产线前两环（拆页 → OCR）在《围城》368 页真实书上**全盘跑通并逐页对账通过**；
-准确率评测做完了（正文页 N1 **99.500%**、汉字 **99.857%**）；
-**下一步是修产物缺陷**（破折号 → 引号），纠错层（audit/rescue/recheck）尚未移植。
+产线四环（拆页 → OCR → 评测 → **纠错层**）全部就位并跑通：
+前两环在《围城》368 页真实书上全盘对账通过；准确率评测完成（正文页 N1 **99.500%**、汉字 **99.857%**）；
+纠错层（`linefix.audit` / `rescue` / `recheck` + `eval` 裁判）已从参考项目移植并按本校产物口径适配，
+`audit` 全书 368 页差异 **0**。
+**下一步仍是修产物缺陷**（破折号 → 引号），外加**给《围城》建自己的冻结台账**。
 
 ---
 
@@ -27,10 +29,11 @@
 | 路径 | 是什么 |
 |---|---|
 | **`D:\Project\pdf2epub`** | **本项目**（唯一要改的地方） |
-| `D:\pdf_to_epub` | 测试/参考项目，**只参考，不要动** |
-| `D:\pdf2epub` | 无关的旧目录 |
+| `D:\App\pdf_to_epub` | 直接前身 / 参考项目（带纠错层与 eval 裁判），**只参考，不要动** |
+| `D:\App\pdf2epub` | 更早一代（《爱尔兰神话全书》时期，**只有 docs，没有可运行代码**），历史证据 |
 
-三者是磁盘上独立目录，没有 junction/symlink。
+三个目录磁盘上互相独立，没有 junction/symlink —— ⚠️ 别再把改动写进参考项目。
+（文档里旧的 `D:\pdf_to_epub` / `D:\pdf2epub` 路径**已不存在**，均已并到 `D:\App\` 下。）
 
 ---
 
@@ -49,10 +52,20 @@
 # 评测报告（读 orign_pdf/textlines/，重算 docs/ocr-accuracy-围城.md）
 .venv/Scripts/python.exe scripts/ocr_accuracy_report.py
 
+# 纠错层三环（详见 docs/ocr-correction-design.md §7）
+.venv/Scripts/python.exe -m linefix.audit  --pages orign_pdf/pages --products orign_pdf/textlines
+.venv/Scripts/python.exe -m linefix.rescue --pages orign_pdf/pages --products orign_pdf/textlines
+.venv/Scripts/python.exe -m linefix.recheck --pages orign_pdf/pages --products orign_pdf/textlines
+
+# 形近字裁判 / 复核贴图
+.venv/Scripts/python.exe eval/score_glyph.py --products orign_pdf/textlines [--set <本书台账>.json]
+.venv/Scripts/python.exe eval/review_sheet.py --pages orign_pdf/pages --review orign_pdf/review_book.json
+
 # 回归（tests/ 下，已入库；测试产生的临时数据仍落在 .tmp/）
 .venv/Scripts/python.exe tests/test_common_review.py          # 73 项
 .venv/Scripts/python.exe tests/test_split_pages_matrix.py     # 83 项
 .venv/Scripts/python.exe tests/test_ocr_review.py             # 98 项
+.venv/Scripts/python.exe tests/test_linefix_review.py         # 79 项（含真实引擎闭环）
 ```
 
 🔴 **单次后台调用超过约 10 分钟会被静默回收** → OCR 必须 `--max-minutes 9` 分批续跑。
@@ -66,10 +79,22 @@
 | ① 拆页 | `pipeline/split_pages.py` | ✅ 跑通（47s / 56MB） |
 | ② OCR | `pipeline/ocr.py` | ✅ 跑通（368/368 页有产物） |
 | ③ 评测 | `scripts/ocr_accuracy_report.py` → `docs/ocr-accuracy-围城.md` | ✅ 已完成（含对齐质量自检） |
-| ④ 纠错层 | `linefix/{audit,rescue,recheck}.py` | ❌ **尚未移植** |
+| ④ 纠错层 | `linefix/{audit,rescue,recheck}.py` + `eval/` | ✅ 已移植适配（审计全书差异 0） |
+| ⑤ EPUB | —— | ❌ 未开始 |
 
 共用实现层 `linefix/common.py` 已对齐参考版完整实现（判据 / 几何 / 图像 IO / 产物读写 /
 证据归一化 / 字级定位 / 引擎构造与指纹）。
+
+### 纠错层实跑记录（2026-10-20）
+- `linefix.audit` 全书 368 页：det 9587 / prod 9585 / **差异 0**；缺 `det_boxes` 0 页。
+- 交叉核对：产物声明丢弃行 2 条（`page_163` 22×20、`page_262` 9×16），**两条都低于最小尺寸门槛**，
+  按碎片忽略 → 与 `diff_boxes` 的 0 差异自洽（这一条如果不按门槛过滤就会**假报警**）。
+- 图版页判据跳过 2 页（`page_001` 封面、`page_368` 末页）。
+- `linefix.rescue`：W1 差异框 0（没有漏行可补）；W2 低 conf 行 8 条，全部被验收拒绝
+  （都是单字符行 `1` / `”` / `è` / `—①`，`accept()` 判「纯符号」或 conf 不够）。
+- `linefix.recheck --limit 40` 抽样：候选 40 位 → 改字 0 / 两路一致 10 / 待核 27 / 删字 1 / 疑无字 2
+  ⇒ **采纳 0 条**（默认 `--adopt cjk` 下确实无可写项；这是正常结果，不是故障）。
+  全量候选约 11488 位（本书「已/己」「楣/媚」「渐/漸」等摇摆密集），全量跑前先 `--limit` 校口径。
 
 ### 全书对账（368 页，验收依据）
 - 9585 行 / 9587 det 框 / 差 2（两条漏行候选：`page_163` `page_262`）
@@ -149,10 +174,16 @@ OCR 产物 717 个 = 244 组 `——` + **229 个单 `—`** ⇒ **394 组被吞
 `己`↔`已`、`刺`↔`剌`、`闾`↔`间`、`伕`↔`侠`、`邝`↔`邝`…
 ⚠️ 通用纠错模型（MacBERT4CSC）**已在本项目被证伪**（净损 −660：改对 10 / 误改 ~670）。
 方向应为：LLM 后纠（按阈值批量、只裁决"提议改动"条目）或混淆集 + 语言模型重打分。
+✅ **工具已就绪**：`linefix.recheck`（原图二次后验 + 结构式判定）+ `eval/score_glyph.py`
+（覆盖率/阈值扫描/复核清单）+ `eval/review_sheet.py`（对照贴图）。
+❌ **还差一份《围城》自己的冻结台账** —— 现有 `eval/glyph_confusion_set.json` 是《爱尔兰神话全书》
+的 34 条，`score_glyph` 会因此**硬拒绝（exit 2）**（页名 `page_NNN` 跨书会"假装命中"，不可信）。
+建台账流程见 `docs/ocr-correction-design.md` §8（脚本只提候选，**认定必须人工看原图**）。
 
 ### ✅ 已完成（不用再做）
 - 页码：已改成 **`lines[].role` 打标记不删除**（`PRODUCT_SCHEMA` 6），全书 363 行已回填。
 - 评测口径：§4 抽查表已统一到剔页码口径；`PAGE_H` 硬编码已去掉（改逐页读 PNG 头）。
+- **纠错层移植**（2026-10-20）：`audit` / `rescue` / `recheck` + `eval` 裁判 + 回归 79 项。
 
 ---
 
@@ -161,6 +192,10 @@ OCR 产物 717 个 = 244 组 `——` + **229 个单 `—`** ⇒ **394 组被吞
 | 坑 | 事实 |
 |---|---|
 | CTC 下的破折号 | `——` 会塌缩成 `—`，这是结构性的 |
+| **`dropped_lines` 里全是碎片** | 拿**全部**丢弃行去和 audit 差异对账会假报警（本书 2 条都是 22×20 / 9×16），必须只比过了 `min_w/min_h` 的 |
+| 修补产物别丢 provenance | `rescue` 若只写引擎指纹，`det_boxes_source`/`top2_floor` 就没了 → 下次 audit 对降级产物**失明** |
+| 补出的行要认领 det 框 | 否则「`lines ∪ dropped` 恰好划分全部 det 框」不变式断了，证据链断 |
+| 台账跨书不可用 | 页名都是 `page_NNN`，异书台账会"假装命中"；只有**定位成功数**可信 |
 | 页码 ≠ 「整行是数字」 | 正文区有 4 行纯数字不是页码（`page_336` 的 `99` 其实是 `——”` 误识） |
 | **不要删页码行** | 删了漏行审计会把页码框误报成「有框无行」；只打 `role` 标记 |
 | 对齐别用中段探针反推 | 反推式隐含「OCR 偏移 == 参考偏移」，丢字就偏右 → 把本页文字判成「插入」 |
@@ -185,8 +220,15 @@ D:\Project\pdf2epub\
 │   ├── split_pages.py          # ① 拆页
 │   └── ocr.py                  # ② OCR（含 lines[].role 页码标记）
 ├── linefix\
-│   ├── common.py               # 共用实现层（判据/几何/IO/指纹/OutputLock）
+│   ├── common.py               # 共用实现层（判据/几何/IO/指纹/OutputLock/字级定位）
+│   ├── audit.py                # ④ 漏行审计（零推理，det−lines 集合差 + 丢弃行交叉核对）
+│   ├── rescue.py               # ④ 行级救援（原图裁框 rec-only，W1/W2）
+│   ├── recheck.py              # ④ 字级定向修复（原图二次后验 + 结构式判定 + 采纳策略）
 │   └── __init__.py
+├── eval\
+│   ├── score_glyph.py          # 形近字裁判：覆盖率/阈值扫描/标定基线/全书复核清单
+│   ├── review_sheet.py         # 人工复核对照贴图（原图裁片 + 判定栏）
+│   └── glyph_confusion_set.json  # 冻结台账（⚠️ 目前是《爱尔兰神话全书》的 34 条，异书会 exit 2）
 ├── scripts\
 │   ├── check_rapidocr_env.py       # 环境自检 34 项
 │   ├── ocr_accuracy_report.py      # 评测 → docs/ocr-accuracy-围城.md
@@ -194,15 +236,18 @@ D:\Project\pdf2epub\
 ├── tests\
 │   ├── test_common_review.py       # 共用层回归 73 项
 │   ├── test_split_pages_matrix.py  # 拆页回归 83 项
-│   └── test_ocr_review.py          # OCR 回归 98 项（临时数据落 .tmp/）
+│   ├── test_ocr_review.py          # OCR 回归 98 项
+│   └── test_linefix_review.py      # 纠错层回归 79 项（含 audit→rescue→audit 闭环）
 ├── docs\
 │   ├── HANDOFF.md                  # 本文档
+│   ├── ocr-correction-design.md    # 纠错层设计基线（口径/阈值/运行手册/移植差异）
 │   ├── ocr-accuracy-围城.md        # 现行评测报告（以此为准）
 │   └── archive\ocr-accuracy-围城-v1.md   # 已封存的历史快照（数字已作废）
 ├── orign_pdf\
 │   ├── 围城.pdf / 围城.txt         # 源书 + 原文对照文本（版次不同！）
 │   ├── pages\                     # 368 张 PNG（56MB，不入库）
-│   └── textlines\                 # 368 个 OCR 产物 + ocr_manifest.json（不入库）
+│   ├── textlines\                 # 368 个 OCR 产物 + ocr_manifest.json（不入库）
+│   └── linefix\                   # audit/rescue 产物（不入库）
 └── .workbuddy\memory\             # MEMORY.md（长期约定）+ 按日工作日志
 ```
 
