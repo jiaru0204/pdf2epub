@@ -14,6 +14,15 @@
 - 三者是磁盘上独立目录，没有 junction/symlink。⚠️ 别再把改动写进参考项目。
   旧路径 `D:\pdf_to_epub` / `D:\pdf2epub` **已不存在**。
 
+## 仓库拓扑（2026-10-20 起）
+- **公开仓库** `origin` = `github.com/jiaru0204/pdf2epub` —— **不含任何书籍原文**
+  （历史已重写，`orign_pdf/*.pdf|*.txt` 在全部 18 个提交里都没有）。
+- **私有归档** `archive` = `github.com/jiaru0204/pdf2epub-archive` —— 旧仓库改名留档，
+  含源书原文，只作备份，**不要再往里推**。
+- 🔴 **源书原文绝不入库**：`orign_pdf/围城.pdf` / `围城.txt` 留在本地磁盘（`.gitignore` 忽略），
+  换书复跑时自备。要往公开仓库提交前，先 `git status` 确认没有 `orign_pdf/*.pdf|*.txt`。
+- 历史重写备份：`.tmp/pre-public-backup-20261020-1747.bundle`（15MB，含源书，本地）。
+
 ## 纠错层（`linefix` + `eval`，2026-10-20 移植并适配）
 - 三环：`linefix.audit`（零推理漏行审计）→ `linefix.rescue`（行级 rec-only 救援）→
   `linefix.recheck`（字级原图二次后验 + 结构式判定，默认只采纳「汉字→汉字」定向替换）。
